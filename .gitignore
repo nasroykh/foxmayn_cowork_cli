@@ -1,0 +1,33 @@
+.claude
+
+# Ignore built Rust files
+/target/
+**/*.rs.bk
+**/*.rs.old
+
+# Ignore environment files
+.env
+.env.*.local
+
+# Ignore IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+.DS_Store
+
+# By-products of `cargo doc`, test coverage, etc.
+/doc/
+/coverage/
+
+# ignore debug log files
+*.log
+
+# Node left-overs sometimes
+node_modules/
+
+# Mac/Windows system files
+Thumbs.db
+ehthumbs.db
