@@ -27,10 +27,22 @@ pub struct Config {
     pub ollama_think: Option<OllamaThink>,
     /// Stream tokens as they arrive. Disabled by `STREAMING=false/0/off`. Default: `true`.
     pub streaming_enabled: bool,
+    /// Execute destructive tools without asking for confirmation. Default: `false`.
+    pub skip_confirmations: bool,
     /// Estimated token ceiling for the conversation. `0` disables the guard.
     pub context_max_tokens: usize,
     /// Fraction of `context_max_tokens` at which a warning is shown (e.g. `0.80`).
     pub context_warn_ratio: f64,
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| match v.to_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => true,
+            "false" | "0" | "off" | "no" => false,
+            _ => default,
+        })
+        .unwrap_or(default)
 }
 
 /// Builds [`RequestReasoning`] for OpenRouter. `OPENROUTER_REASONING_EFFORT=off` (or empty) omits
@@ -48,18 +60,18 @@ fn openrouter_reasoning_from_env() -> Option<RequestReasoning> {
         Err(_) => Some(ReasoningEffort::Minimal),
     };
 
-    let summary: Option<ReasoningSummaryVerbosity> = match std::env::var("OPENROUTER_REASONING_SUMMARY")
-    {
-        Ok(s) if s.is_empty() || s.eq_ignore_ascii_case("off") => None,
-        Ok(s) => match ReasoningSummaryVerbosity::from_str(&s) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("[config] {e} — omitting reasoning summary");
-                None
-            }
-        },
-        Err(_) => None,
-    };
+    let summary: Option<ReasoningSummaryVerbosity> =
+        match std::env::var("OPENROUTER_REASONING_SUMMARY") {
+            Ok(s) if s.is_empty() || s.eq_ignore_ascii_case("off") => None,
+            Ok(s) => match ReasoningSummaryVerbosity::from_str(&s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("[config] {e} — omitting reasoning summary");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
 
     Some(RequestReasoning { effort, summary })
 }
@@ -113,9 +125,8 @@ impl Config {
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into()),
             openrouter_reasoning,
             ollama_think,
-            streaming_enabled: std::env::var("STREAMING")
-                .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "off"))
-                .unwrap_or(true),
+            streaming_enabled: env_bool("STREAMING", true),
+            skip_confirmations: env_bool("SKIP_CONFIRMATIONS", false),
             context_max_tokens: std::env::var("CONTEXT_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -127,7 +138,13 @@ impl Config {
         }
     }
 
-    pub fn with_overrides(mut self, provider: Option<Provider>, model: Option<String>) -> Self {
+    pub fn with_overrides(
+        mut self,
+        provider: Option<Provider>,
+        model: Option<String>,
+        streaming: Option<bool>,
+        skip_confirmations: bool,
+    ) -> Self {
         if let Some(p) = provider {
             if p != self.provider {
                 self.openrouter_reasoning = if matches!(p, Provider::OpenRouter) {
@@ -145,6 +162,12 @@ impl Config {
         }
         if let Some(m) = model {
             self.model = m;
+        }
+        if let Some(s) = streaming {
+            self.streaming_enabled = s;
+        }
+        if skip_confirmations {
+            self.skip_confirmations = true;
         }
         self
     }

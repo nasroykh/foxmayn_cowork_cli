@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -8,6 +10,8 @@ use crate::fs::FileEntry;
 use crate::llm;
 use crate::llm::tools::{ToolCallResult, dispatch_tool_call, execute_tool, tool_definitions};
 use crate::llm::types::{ChatRequest, FunctionCall, Message, StreamChunk, ToolCall};
+
+pub type RequestId = u64;
 
 // ── File tree display type ────────────────────────────────────────────────────
 
@@ -100,7 +104,11 @@ pub enum LlmOutcome {
 
 pub enum AppEvent {
     /// Result of send_message or confirm_tool: (outcome, updated conversation)
-    LlmResponse(LlmOutcome, Vec<Message>),
+    LlmResponse {
+        request_id: Option<RequestId>,
+        outcome: LlmOutcome,
+        conversation: Vec<Message>,
+    },
     HealthCheckResult(bool),
     FileTreeLoaded(Result<Vec<FileEntry>, AppError>),
     SubdirLoaded {
@@ -108,11 +116,32 @@ pub enum AppEvent {
         result: Result<Vec<FileEntry>, AppError>,
     },
     /// A single streamed content delta — forwarded live during streaming.
-    StreamChunk(StreamChunk),
+    StreamChunk {
+        request_id: RequestId,
+        chunk: StreamChunk,
+    },
     /// Streaming round complete — carry the final outcome and updated conversation.
-    StreamComplete(LlmOutcome, Vec<Message>),
+    StreamComplete {
+        request_id: RequestId,
+        outcome: LlmOutcome,
+        conversation: Vec<Message>,
+    },
     /// Near-context-limit warning to display in chat before proceeding.
     ContextWarning(String),
+    /// Intermediate assistant text from a multi-round agentic loop. Flushes any
+    /// in-progress streaming buffer to a permanent chat entry so subsequent
+    /// rounds start fresh.
+    IntermediateAssistant {
+        request_id: RequestId,
+        content: String,
+    },
+    /// A tool call that ran during the agentic loop — surfaced live so the user
+    /// can see which operations the AI performed.
+    IntermediateTool {
+        request_id: RequestId,
+        name: String,
+        result: String,
+    },
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -134,13 +163,34 @@ pub struct App {
     pub file_tree_scroll: usize,
     pub focused_panel: Panel,
     pub should_quit: bool,
+    /// Paths of directories that should be re-expanded after the next root
+    /// file-tree reload. Populated by `prepare_refresh`, drained by the TUI
+    /// event handler as `FileTreeLoaded` / `SubdirLoaded` events arrive.
+    pub pending_expansions: HashSet<String>,
+    /// Path of the entry to scroll back to after the next root reload.
+    pub pending_scroll_path: Option<String>,
+    /// Handle of the currently in-flight LLM request (if any), so the user
+    /// can cancel it with Esc. Cleared on `StreamComplete` / `LlmResponse`.
+    pub current_request: Option<JoinHandle<()>>,
+    /// Monotonic request generation. LLM events carry this id so stale events
+    /// from cancelled or superseded tasks can be ignored safely.
+    pub active_request_id: Option<RequestId>,
+    next_request_id: RequestId,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
+        // Fast-fail on unreachable hosts; intentionally no overall `timeout()` so
+        // long-running streaming responses (slow Ollama models, multi-round
+        // agentic loops) aren't truncated mid-flight.
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
             config,
-            http_client: reqwest::Client::new(),
+            http_client,
             conversation: Vec::new(),
             working_dir: None,
             chat_messages: Vec::new(),
@@ -154,7 +204,102 @@ impl App {
             file_tree_scroll: 0,
             focused_panel: Panel::Chat,
             should_quit: false,
+            pending_expansions: HashSet::new(),
+            pending_scroll_path: None,
+            current_request: None,
+            active_request_id: None,
+            next_request_id: 1,
         }
+    }
+
+    pub fn allocate_request_id(&mut self) -> RequestId {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        self.active_request_id = Some(id);
+        id
+    }
+
+    pub fn is_active_request(&self, request_id: RequestId) -> bool {
+        self.active_request_id == Some(request_id)
+    }
+
+    /// Snapshot expansion + scroll state into `pending_*` so they can be
+    /// restored after the file tree is rebuilt by the next reload. Call this
+    /// before issuing an auto-refresh that would otherwise wipe expansion.
+    pub fn prepare_refresh(&mut self) {
+        self.pending_expansions = self
+            .file_tree
+            .iter()
+            .filter(|e| e.is_dir && e.expanded)
+            .map(|e| e.path.clone())
+            .collect();
+        self.pending_scroll_path = self
+            .file_tree
+            .get(self.file_tree_scroll)
+            .map(|e| e.path.clone());
+    }
+
+    /// Mark `path` expanded if it exists in the tree and isn't already.
+    /// Returns true if the caller should spawn a subdir load for it.
+    pub fn mark_expanded(&mut self, path: &str) -> bool {
+        if let Some(idx) = self.file_tree.iter().position(|e| e.path == path)
+            && self.file_tree[idx].is_dir
+            && !self.file_tree[idx].expanded
+        {
+            self.file_tree[idx].expanded = true;
+            return true;
+        }
+        false
+    }
+
+    /// Walk the current tree and return paths still pending expansion that
+    /// now exist as un-expanded directory entries. Caller is expected to
+    /// `mark_expanded` each one and spawn the corresponding subdir load.
+    pub fn drain_ready_pending_expansions(&mut self) -> Vec<String> {
+        if self.pending_expansions.is_empty() {
+            return Vec::new();
+        }
+        let ready: Vec<String> = self
+            .file_tree
+            .iter()
+            .filter(|e| e.is_dir && !e.expanded && self.pending_expansions.contains(&e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        for p in &ready {
+            self.pending_expansions.remove(p);
+        }
+        ready
+    }
+
+    /// Move scroll back to `pending_scroll_path` if it still exists in the
+    /// tree. Cleared after a single successful application.
+    pub fn restore_pending_scroll(&mut self) {
+        let Some(path) = self.pending_scroll_path.clone() else {
+            return;
+        };
+        if let Some(idx) = self.file_tree.iter().position(|e| e.path == path) {
+            self.file_tree_scroll = idx;
+            self.pending_scroll_path = None;
+        }
+    }
+
+    /// Abort the in-flight LLM request (if any) and reset transient UI state
+    /// so the user can immediately type a new prompt.
+    pub fn cancel_request(&mut self) -> bool {
+        let Some(handle) = self.current_request.take() else {
+            return false;
+        };
+        handle.abort();
+        self.active_request_id = None;
+        self.is_loading = false;
+        self.streaming_text = None;
+        self.input_mode = InputMode::Editing;
+        self.pending_confirmation = None;
+        self.chat_messages.push(ChatEntry {
+            role: ChatRole::Warning,
+            content: "Request cancelled.".into(),
+        });
+        true
     }
 
     /// Call before spawning send_message task: records user message in display and sets loading.
@@ -370,6 +515,9 @@ impl App {
         self.input_mode = InputMode::Editing;
         self.file_tree_scroll = 0;
         self.chat_scroll = 0;
+        // Drop any expansion/scroll memory from the previous working dir.
+        self.pending_expansions.clear();
+        self.pending_scroll_path = None;
     }
 
     pub fn clear_conversation(&mut self) {
@@ -417,10 +565,7 @@ struct PartialToolCall {
 /// If `user_message_for_pending` is non-empty, it is used in `LlmOutcome::PendingConfirmation`
 /// (new user turn from `send_message`). Otherwise, the most recent `user` turn in
 /// `conversation` is used (e.g. after a confirmed tool).
-fn last_user_for_pending(
-    user_message_for_pending: &str,
-    conversation: &[Message],
-) -> String {
+fn last_user_for_pending(user_message_for_pending: &str, conversation: &[Message]) -> String {
     if !user_message_for_pending.is_empty() {
         user_message_for_pending.to_string()
     } else {
@@ -431,6 +576,28 @@ fn last_user_for_pending(
             .map(|m| m.content.clone())
             .unwrap_or_default()
     }
+}
+
+async fn apply_confirmation_policy(
+    mut result: ToolCallResult,
+    base_path: &Path,
+    skip_confirmations: bool,
+) -> ToolCallResult {
+    if !result.requires_confirmation || !skip_confirmations {
+        return result;
+    }
+
+    let call = FunctionCall {
+        name: result.tool_name.clone(),
+        arguments: result.args.clone(),
+    };
+    result.result = Some(match execute_tool(&call, base_path).await {
+        Ok(output) => output,
+        Err(e) => format!("Error: {e}"),
+    });
+    result.requires_confirmation = false;
+    result.description = format!("{} (confirmation skipped)", result.description);
+    result
 }
 
 /// LLM call → (optional) non-destructive tool execution → feed back → repeat until
@@ -449,6 +616,7 @@ async fn run_agentic_loop(
     user_message_for_pending: String,
 ) -> (LlmOutcome, Vec<Message>) {
     let mut user_in_conversation = new_user.is_none();
+    let mut tool_summaries: Vec<String> = Vec::new();
     const MAX_TOOL_ROUNDS: usize = 10;
 
     for _ in 0..MAX_TOOL_ROUNDS {
@@ -494,7 +662,7 @@ async fn run_agentic_loop(
             return (
                 LlmOutcome::Complete {
                     assistant_message: content,
-                    tool_results: vec![],
+                    tool_results: tool_summaries,
                 },
                 conversation,
             );
@@ -534,6 +702,7 @@ async fn run_agentic_loop(
                     );
                 }
             };
+            let r = apply_confirmation_policy(r, base_path, config.skip_confirmations).await;
 
             if r.requires_confirmation {
                 if !user_in_conversation && let Some(m) = new_user.as_ref() {
@@ -565,6 +734,7 @@ async fn run_agentic_loop(
         conversation.push(assistant_msg);
         for (tc, result) in tool_calls.iter().zip(dispatched.iter()) {
             let s = result.result.clone().unwrap_or_default();
+            tool_summaries.push(format_tool_summary(&result.description, &s));
             let tmsg = Message::tool_result(&tc.function.name, &s, tc.id.clone());
             working.push(tmsg.clone());
             conversation.push(tmsg);
@@ -579,6 +749,26 @@ async fn run_agentic_loop(
     )
 }
 
+/// Build a one-line tool summary suitable for display in the chat panel.
+/// Truncates the result so a long file listing doesn't dominate the UI.
+fn format_tool_summary(description: &str, result: &str) -> String {
+    let trimmed = result.trim();
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    let max = 120;
+    let summary: String = if first_line.chars().count() <= max {
+        first_line.to_string()
+    } else {
+        let mut s: String = first_line.chars().take(max - 1).collect();
+        s.push('…');
+        s
+    };
+    if summary.is_empty() {
+        description.to_string()
+    } else {
+        format!("{description} → {summary}")
+    }
+}
+
 /// Streaming variant of `run_agentic_loop`. Forwards `ContentDelta` chunks to `tx`
 /// as they arrive so the TUI can render them incrementally.
 #[allow(clippy::too_many_arguments)]
@@ -590,6 +780,7 @@ async fn run_agentic_loop_streaming(
     mut conversation: Vec<Message>,
     new_user: Option<Message>,
     user_message_for_pending: String,
+    request_id: RequestId,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> (LlmOutcome, Vec<Message>) {
     let mut user_in_conversation = new_user.is_none();
@@ -624,7 +815,10 @@ async fn run_agentic_loop_streaming(
                 None => break,
                 Some(StreamChunk::ContentDelta(text)) => {
                     content.push_str(&text);
-                    let _ = tx.send(AppEvent::StreamChunk(StreamChunk::ContentDelta(text)));
+                    let _ = tx.send(AppEvent::StreamChunk {
+                        request_id,
+                        chunk: StreamChunk::ContentDelta(text),
+                    });
                 }
                 Some(StreamChunk::ToolCallDelta {
                     index,
@@ -731,6 +925,7 @@ async fn run_agentic_loop_streaming(
                     );
                 }
             };
+            let r = apply_confirmation_policy(r, base_path, config.skip_confirmations).await;
 
             if r.requires_confirmation {
                 if !user_in_conversation && let Some(m) = new_user.as_ref() {
@@ -758,10 +953,23 @@ async fn run_agentic_loop_streaming(
             conversation.push(m.clone());
             user_in_conversation = true;
         }
+        // Flush the streamed assistant text to the chat as a permanent entry
+        // before the next round overwrites the live buffer.
+        if !content.trim().is_empty() {
+            let _ = tx.send(AppEvent::IntermediateAssistant {
+                request_id,
+                content: content.clone(),
+            });
+        }
         working.push(assistant_msg.clone());
         conversation.push(assistant_msg);
         for (tc, result) in tool_calls.iter().zip(dispatched.iter()) {
             let s = result.result.clone().unwrap_or_default();
+            let _ = tx.send(AppEvent::IntermediateTool {
+                request_id,
+                name: tc.function.name.clone(),
+                result: format_tool_summary(&result.description, &s),
+            });
             let tmsg = Message::tool_result(&tc.function.name, &s, tc.id.clone());
             working.push(tmsg.clone());
             conversation.push(tmsg);
@@ -877,6 +1085,7 @@ pub async fn send_message_streaming(
     conversation: Vec<Message>,
     working_dir: Option<PathBuf>,
     user_message: String,
+    request_id: RequestId,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> (LlmOutcome, Vec<Message>) {
     if working_dir.is_none() {
@@ -902,11 +1111,16 @@ pub async fn send_message_streaming(
         conversation,
         Some(user_msg),
         user_message,
+        request_id,
         &tx,
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Streaming confirmation needs the pending tool, request generation, and event channel"
+)]
 pub async fn confirm_tool_streaming(
     client: reqwest::Client,
     config: Config,
@@ -914,6 +1128,7 @@ pub async fn confirm_tool_streaming(
     mut conversation: Vec<Message>,
     pending: PendingToolCall,
     approved: bool,
+    request_id: RequestId,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> (LlmOutcome, Vec<Message>) {
     if !approved {
@@ -965,6 +1180,7 @@ pub async fn confirm_tool_streaming(
         conversation,
         None,
         String::new(),
+        request_id,
         &tx,
     )
     .await
@@ -996,9 +1212,8 @@ fn system_prompt(working_dir: &Option<PathBuf>) -> String {
         - `patch_file` fails if the search text appears 0 or more than once — fall back to `edit_file` in that case.\n\
         \n\
         MULTI-STEP OPERATIONS:\n\
-        - For tasks that affect multiple files (e.g. 'delete all .md files'), handle them one file at a time.\n\
-        - Start by calling list_files to find the relevant files, then act on the first one.\n\
-        - After each operation completes, the user will ask you to continue if there are more.\n\
-        - Never try to batch multiple destructive operations in a single response."
+        - For tasks that affect multiple known paths, prefer bulk tools (`delete_many`, `rename_many`) over repeated single-file calls.\n\
+        - For filename-pattern tasks (e.g. 'delete all .md files' or 'rename .jpeg to .jpg'), prefer `delete_matching` or `rename_matching` so the user sees one confirmation.\n\
+        - Use one-file-at-a-time operations only when the user explicitly asks for stepwise execution."
     )
 }

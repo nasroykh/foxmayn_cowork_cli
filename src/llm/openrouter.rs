@@ -122,14 +122,20 @@ async fn process_sse_stream(response: reqwest::Response, tx: UnboundedSender<Str
             buffer.drain(..pos + 2);
 
             for line in message.lines() {
-                let Some(data) = line.strip_prefix("data: ") else { continue };
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
                 let data = data.trim();
                 if data == "[DONE]" {
                     let _ = tx.send(StreamChunk::Done);
                     break 'outer;
                 }
-                let Ok(resp) = serde_json::from_str::<SseResponse>(data) else { continue };
-                let Some(choice) = resp.choices.into_iter().next() else { continue };
+                let Ok(resp) = serde_json::from_str::<SseResponse>(data) else {
+                    continue;
+                };
+                let Some(choice) = resp.choices.into_iter().next() else {
+                    continue;
+                };
                 let delta = choice.delta;
                 if let Some(content) = delta.content
                     && !content.is_empty()

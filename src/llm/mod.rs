@@ -31,9 +31,7 @@ pub async fn chat_stream(
     tx: UnboundedSender<StreamChunk>,
 ) -> Result<(), crate::error::AppError> {
     match config.provider {
-        Provider::Ollama => {
-            ollama::chat_stream(client, request, &config.ollama_base_url, tx).await
-        }
+        Provider::Ollama => ollama::chat_stream(client, request, &config.ollama_base_url, tx).await,
         Provider::OpenRouter => {
             let key = config.openrouter_api_key.as_deref().unwrap_or("");
             openrouter::chat_stream(client, request, &config.openrouter_base_url, key, tx).await

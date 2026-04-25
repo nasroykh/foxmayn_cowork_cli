@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers, MouseEventKind},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -22,7 +25,12 @@ pub mod widgets;
 pub async fn run(mut app: App) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -30,14 +38,24 @@ pub async fn run(mut app: App) -> io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         original_hook(info);
     }));
 
     let result = run_loop(&mut terminal, &mut app).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -110,6 +128,20 @@ fn handle_crossterm_event(
             }
             return;
         }
+        Event::Paste(text) => {
+            // Paste only makes sense into the chat input; ignore otherwise.
+            if app.input_mode == InputMode::Editing && app.focused_panel == Panel::Chat {
+                let mut first = true;
+                for line in text.split('\n') {
+                    if !first {
+                        textarea.insert_newline();
+                    }
+                    textarea.insert_str(line);
+                    first = false;
+                }
+            }
+            return;
+        }
         Event::Key(_) => {}
         _ => return,
     }
@@ -135,7 +167,17 @@ fn handle_crossterm_event(
         },
 
         InputMode::Editing => match key.code {
-            KeyCode::Enter => {
+            // Esc cancels an in-flight LLM request, if any.
+            KeyCode::Esc if app.is_loading || app.streaming_text.is_some() => {
+                app.cancel_request();
+            }
+            // Plain Enter submits; Shift/Alt+Enter inserts a newline so the
+            // user can compose multi-paragraph prompts.
+            KeyCode::Enter
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
                 // File tree panel: Enter toggles directory expand/collapse
                 if app.focused_panel == Panel::FileTree {
                     if let Some(path) = app.toggle_expand() {
@@ -167,8 +209,10 @@ fn handle_crossterm_event(
             }
             KeyCode::Left if app.focused_panel == Panel::FileTree => {
                 let idx = app.file_tree_scroll;
-                let should_collapse =
-                    app.file_tree.get(idx).is_some_and(|e| e.is_dir && e.expanded);
+                let should_collapse = app
+                    .file_tree
+                    .get(idx)
+                    .is_some_and(|e| e.is_dir && e.expanded);
                 if should_collapse {
                     app.collapse_dir(idx);
                 } else {
@@ -201,25 +245,83 @@ fn handle_crossterm_event(
 
 fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) {
     match event {
-        AppEvent::LlmResponse(outcome, conversation) => {
+        AppEvent::LlmResponse {
+            request_id,
+            outcome,
+            conversation,
+        } => {
+            if request_id.is_some_and(|id| !app.is_active_request(id)) {
+                return;
+            }
             // Refresh the file tree after any successful LLM response so newly
             // created/deleted/renamed files appear without a manual /dir reload.
             let should_refresh = matches!(outcome, app::LlmOutcome::Complete { .. });
+            app.current_request = None;
+            app.active_request_id = None;
             app.handle_outcome(outcome, conversation);
             if should_refresh && let Some(dir) = app.working_dir.clone() {
+                app.prepare_refresh();
                 spawn_file_tree_load(dir, tx.clone());
             }
         }
-        AppEvent::StreamChunk(chunk) => {
+        AppEvent::StreamChunk { request_id, chunk } => {
+            if !app.is_active_request(request_id) {
+                return;
+            }
             app.handle_stream_chunk(&chunk);
         }
-        AppEvent::StreamComplete(outcome, conversation) => {
+        AppEvent::StreamComplete {
+            request_id,
+            outcome,
+            conversation,
+        } => {
+            if !app.is_active_request(request_id) {
+                return;
+            }
             app.finalize_stream();
             let should_refresh = matches!(outcome, app::LlmOutcome::Complete { .. });
+            app.current_request = None;
+            app.active_request_id = None;
             app.handle_outcome(outcome, conversation);
             if should_refresh && let Some(dir) = app.working_dir.clone() {
+                app.prepare_refresh();
                 spawn_file_tree_load(dir, tx.clone());
             }
+        }
+        AppEvent::IntermediateAssistant {
+            request_id,
+            content,
+        } => {
+            if !app.is_active_request(request_id) {
+                return;
+            }
+            // Flush the live streaming buffer to a permanent chat entry so
+            // subsequent rounds don't overwrite this round's text.
+            app.streaming_text = None;
+            if !content.trim().is_empty() {
+                app.chat_messages.push(app::ChatEntry {
+                    role: app::ChatRole::Assistant,
+                    content,
+                });
+            }
+        }
+        AppEvent::IntermediateTool {
+            request_id,
+            name,
+            result,
+        } => {
+            if !app.is_active_request(request_id) {
+                return;
+            }
+            let display = if result.is_empty() {
+                format!("[{name}]")
+            } else {
+                format!("[{name}] {result}")
+            };
+            app.chat_messages.push(app::ChatEntry {
+                role: app::ChatRole::Tool,
+                content: display,
+            });
         }
         AppEvent::ContextWarning(msg) => {
             app.chat_messages.push(app::ChatEntry {
@@ -232,9 +334,28 @@ fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEven
         }
         AppEvent::FileTreeLoaded(result) => {
             app.handle_file_tree(result);
+            restore_pending_expansions(app, tx);
+            app.restore_pending_scroll();
         }
-        AppEvent::SubdirLoaded { parent_path, result } => {
+        AppEvent::SubdirLoaded {
+            parent_path,
+            result,
+        } => {
             app.handle_subdir_loaded(parent_path, result);
+            restore_pending_expansions(app, tx);
+            app.restore_pending_scroll();
+        }
+    }
+}
+
+/// After a tree (re)load, re-expand any directories that were expanded before
+/// the refresh. Each newly expanded dir triggers its own subdir load, which
+/// recursively cascades through nested expansions.
+fn restore_pending_expansions(app: &mut App, tx: &UnboundedSender<AppEvent>) {
+    let ready = app.drain_ready_pending_expansions();
+    for path in ready {
+        if app.mark_expanded(&path) {
+            spawn_subdir_load(path, tx.clone());
         }
     }
 }
@@ -280,16 +401,17 @@ fn check_context(
     let estimated = llm::estimate_tokens(conversation);
     let ratio = estimated as f64 / config.context_max_tokens as f64;
     if ratio >= 1.0 {
-        let _ = tx.send(AppEvent::LlmResponse(
-            app::LlmOutcome::Error {
+        let _ = tx.send(AppEvent::LlmResponse {
+            request_id: None,
+            outcome: app::LlmOutcome::Error {
                 message: format!(
                     "Conversation is too long (~{estimated} tokens, limit {}). \
                      Press Ctrl+L to clear and start fresh.",
                     config.context_max_tokens
                 ),
             },
-            conversation.to_vec(),
-        ));
+            conversation: conversation.to_vec(),
+        });
         return false;
     }
     if ratio >= config.context_warn_ratio {
@@ -303,7 +425,7 @@ fn check_context(
     true
 }
 
-fn spawn_send_message(app: &App, tx: UnboundedSender<AppEvent>, text: String) {
+fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String) {
     let client = app.http_client.clone();
     let config = app.config.clone();
     let conversation = app.conversation.clone();
@@ -313,24 +435,42 @@ fn spawn_send_message(app: &App, tx: UnboundedSender<AppEvent>, text: String) {
         return;
     }
 
+    let request_id = app.allocate_request_id();
     if config.streaming_enabled {
         let tx2 = tx.clone();
-        tokio::spawn(async move {
-            let (outcome, conv) =
-                app::send_message_streaming(client, config, conversation, working_dir, text, tx2.clone())
-                    .await;
-            let _ = tx2.send(AppEvent::StreamComplete(outcome, conv));
+        let h = tokio::spawn(async move {
+            let (outcome, conv) = app::send_message_streaming(
+                client,
+                config,
+                conversation,
+                working_dir,
+                text,
+                request_id,
+                tx2.clone(),
+            )
+            .await;
+            let _ = tx2.send(AppEvent::StreamComplete {
+                request_id,
+                outcome,
+                conversation: conv,
+            });
         });
+        app.current_request = Some(h);
     } else {
-        tokio::spawn(async move {
+        let h = tokio::spawn(async move {
             let (outcome, conv) =
                 app::send_message(client, config, conversation, working_dir, text).await;
-            let _ = tx.send(AppEvent::LlmResponse(outcome, conv));
+            let _ = tx.send(AppEvent::LlmResponse {
+                request_id: Some(request_id),
+                outcome,
+                conversation: conv,
+            });
         });
+        app.current_request = Some(h);
     }
 }
 
-fn spawn_confirm_tool(app: &App, tx: UnboundedSender<AppEvent>, approved: bool) {
+fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bool) {
     let Some(pending) = app.pending_confirmation.clone() else {
         return;
     };
@@ -344,21 +484,40 @@ fn spawn_confirm_tool(app: &App, tx: UnboundedSender<AppEvent>, approved: bool) 
         return;
     }
 
+    let request_id = app.allocate_request_id();
     if config.streaming_enabled {
         let tx2 = tx.clone();
-        tokio::spawn(async move {
-            let (outcome, conv) =
-                app::confirm_tool_streaming(client, config, working_dir, conversation, pending, approved, tx2.clone())
-                    .await;
-            let _ = tx2.send(AppEvent::StreamComplete(outcome, conv));
+        let h = tokio::spawn(async move {
+            let (outcome, conv) = app::confirm_tool_streaming(
+                client,
+                config,
+                working_dir,
+                conversation,
+                pending,
+                approved,
+                request_id,
+                tx2.clone(),
+            )
+            .await;
+            let _ = tx2.send(AppEvent::StreamComplete {
+                request_id,
+                outcome,
+                conversation: conv,
+            });
         });
+        app.current_request = Some(h);
     } else {
-        tokio::spawn(async move {
+        let h = tokio::spawn(async move {
             let (outcome, conv) =
                 app::confirm_tool(client, config, working_dir, conversation, pending, approved)
                     .await;
-            let _ = tx.send(AppEvent::LlmResponse(outcome, conv));
+            let _ = tx.send(AppEvent::LlmResponse {
+                request_id: Some(request_id),
+                outcome,
+                conversation: conv,
+            });
         });
+        app.current_request = Some(h);
     }
 }
 
@@ -382,12 +541,12 @@ fn update_textarea_style(textarea: &mut TextArea, app: &App) {
 
     let (title, style) = if app.streaming_text.is_some() {
         (
-            " Streaming... ",
+            " Streaming... — Esc to cancel ",
             Style::default().fg(ratatui::style::Color::DarkGray),
         )
     } else if app.is_loading {
         (
-            " Waiting for response... ",
+            " Waiting for response — Esc to cancel ",
             Style::default().fg(ratatui::style::Color::DarkGray),
         )
     } else if app.input_mode == InputMode::Confirming {

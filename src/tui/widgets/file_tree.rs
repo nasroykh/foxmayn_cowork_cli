@@ -58,10 +58,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                (
-                    format!("{indent}  "),
-                    Style::default().fg(Color::White),
-                )
+                (format!("{indent}  "), Style::default().fg(Color::White))
             };
             ListItem::new(Line::from(vec![
                 Span::styled(prefix, style),

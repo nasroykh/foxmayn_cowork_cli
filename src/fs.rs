@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use tokio::fs;
 
@@ -72,9 +73,56 @@ pub async fn delete_file(path: String) -> Result<(), AppError> {
     Ok(())
 }
 
+pub async fn delete_many(paths: Vec<String>) -> Result<usize, AppError> {
+    if paths.is_empty() {
+        return Err(AppError::ToolValidation(
+            "No paths were provided for bulk delete".into(),
+        ));
+    }
+
+    let count = paths.len();
+    for path in paths {
+        delete_file(path).await?;
+    }
+    Ok(count)
+}
+
 pub async fn rename_file(old_path: String, new_path: String) -> Result<(), AppError> {
     fs::rename(&old_path, &new_path).await?;
     Ok(())
+}
+
+pub async fn rename_many(operations: Vec<(String, String)>) -> Result<usize, AppError> {
+    if operations.is_empty() {
+        return Err(AppError::ToolValidation(
+            "No operations were provided for bulk rename".into(),
+        ));
+    }
+
+    let mut destinations = HashSet::new();
+    for (old_path, new_path) in &operations {
+        if !fs::try_exists(old_path).await? {
+            return Err(AppError::ToolValidation(format!(
+                "Source does not exist: {old_path}"
+            )));
+        }
+        if fs::try_exists(new_path).await? {
+            return Err(AppError::ToolValidation(format!(
+                "Destination already exists: {new_path}"
+            )));
+        }
+        if !destinations.insert(new_path.clone()) {
+            return Err(AppError::ToolValidation(format!(
+                "Duplicate destination in rename plan: {new_path}"
+            )));
+        }
+    }
+
+    let count = operations.len();
+    for (old_path, new_path) in operations {
+        rename_file(old_path, new_path).await?;
+    }
+    Ok(count)
 }
 
 pub async fn create_directory(path: String) -> Result<(), AppError> {
@@ -130,12 +178,7 @@ pub async fn search_in_files(
                     if re.is_match(line) {
                         total_matches += 1;
                         if results.len() < max_results {
-                            results.push(format!(
-                                "{}:{}: {}",
-                                file_str,
-                                line_num + 1,
-                                line.trim()
-                            ));
+                            results.push(format!("{}:{}: {}", file_str, line_num + 1, line.trim()));
                         }
                     }
                 }
@@ -154,6 +197,45 @@ pub async fn search_in_files(
         ));
     }
     Ok(output)
+}
+
+pub async fn matching_files(
+    dir: String,
+    filename_regex: String,
+    recursive: bool,
+    max_matches: usize,
+) -> Result<Vec<String>, AppError> {
+    let re = regex::Regex::new(&filename_regex)
+        .map_err(|e| AppError::ToolValidation(format!("Invalid filename regex: {e}")))?;
+
+    let mut matches = Vec::new();
+    let mut dirs_to_visit = vec![dir];
+
+    while let Some(current_dir) = dirs_to_visit.pop() {
+        let mut entries = fs::read_dir(&current_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_type = entry.file_type().await?;
+
+            if file_type.is_dir() {
+                if recursive && !name.starts_with('.') && name != "node_modules" && name != "target"
+                {
+                    dirs_to_visit.push(path.to_string_lossy().into_owned());
+                }
+            } else if file_type.is_file() && re.is_match(&name) {
+                matches.push(path.to_string_lossy().into_owned());
+                if matches.len() > max_matches {
+                    return Err(AppError::ToolValidation(format!(
+                        "Matched more than {max_matches} files; narrow the pattern before running a bulk operation"
+                    )));
+                }
+            }
+        }
+    }
+
+    matches.sort();
+    Ok(matches)
 }
 
 pub async fn patch_file(path: String, search: String, replace: String) -> Result<(), AppError> {

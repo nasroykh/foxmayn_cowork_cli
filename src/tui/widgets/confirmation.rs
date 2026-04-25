@@ -13,7 +13,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let popup = centered_rect(62, 7, area);
+    let popup = centered_rect(76, 14, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()

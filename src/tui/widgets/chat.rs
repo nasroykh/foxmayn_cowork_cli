@@ -121,10 +121,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(*line, content_style),
                     ]
                 } else {
-                    vec![
-                        Span::raw("       │ "),
-                        Span::styled(*line, content_style),
-                    ]
+                    vec![Span::raw("       │ "), Span::styled(*line, content_style)]
                 };
                 if is_last {
                     spans.push(Span::styled("▌", content_style));
@@ -156,7 +153,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|line| {
             let w = line.width();
-            if w == 0 { 1usize } else { w.div_ceil(col_width) }
+            if w == 0 {
+                1usize
+            } else {
+                w.div_ceil(col_width)
+            }
         })
         .sum::<usize>()
         .min(u16::MAX as usize) as u16;
