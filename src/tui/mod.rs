@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyModifiers},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -22,7 +22,7 @@ pub mod widgets;
 pub async fn run(mut app: App) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -30,14 +30,14 @@ pub async fn run(mut app: App) -> io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         original_hook(info);
     }));
 
     let result = run_loop(&mut terminal, &mut app).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     result
@@ -95,6 +95,25 @@ fn handle_crossterm_event(
     textarea: &mut TextArea,
     tx: &UnboundedSender<AppEvent>,
 ) {
+    match event {
+        Event::Mouse(mouse) => {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => match app.focused_panel {
+                    Panel::Chat => app.scroll_chat_up(),
+                    Panel::FileTree => app.scroll_tree_up(),
+                },
+                MouseEventKind::ScrollDown => match app.focused_panel {
+                    Panel::Chat => app.scroll_chat_down(),
+                    Panel::FileTree => app.scroll_tree_down(),
+                },
+                _ => {}
+            }
+            return;
+        }
+        Event::Key(_) => {}
+        _ => return,
+    }
+
     let Event::Key(key) = event else { return };
 
     // Global quit
@@ -191,6 +210,23 @@ fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEven
                 spawn_file_tree_load(dir, tx.clone());
             }
         }
+        AppEvent::StreamChunk(chunk) => {
+            app.handle_stream_chunk(&chunk);
+        }
+        AppEvent::StreamComplete(outcome, conversation) => {
+            app.finalize_stream();
+            let should_refresh = matches!(outcome, app::LlmOutcome::Complete { .. });
+            app.handle_outcome(outcome, conversation);
+            if should_refresh && let Some(dir) = app.working_dir.clone() {
+                spawn_file_tree_load(dir, tx.clone());
+            }
+        }
+        AppEvent::ContextWarning(msg) => {
+            app.chat_messages.push(app::ChatEntry {
+                role: app::ChatRole::Warning,
+                content: msg,
+            });
+        }
         AppEvent::HealthCheckResult(ok) => {
             app.handle_health(ok);
         }
@@ -231,16 +267,67 @@ fn spawn_subdir_load(path: String, tx: UnboundedSender<AppEvent>) {
     });
 }
 
+/// Check estimated token count and emit warnings/errors before the LLM call.
+/// Returns `false` if the call should be aborted (context full).
+fn check_context(
+    config: &crate::config::Config,
+    conversation: &[crate::llm::types::Message],
+    tx: &UnboundedSender<AppEvent>,
+) -> bool {
+    if config.context_max_tokens == 0 {
+        return true;
+    }
+    let estimated = llm::estimate_tokens(conversation);
+    let ratio = estimated as f64 / config.context_max_tokens as f64;
+    if ratio >= 1.0 {
+        let _ = tx.send(AppEvent::LlmResponse(
+            app::LlmOutcome::Error {
+                message: format!(
+                    "Conversation is too long (~{estimated} tokens, limit {}). \
+                     Press Ctrl+L to clear and start fresh.",
+                    config.context_max_tokens
+                ),
+            },
+            conversation.to_vec(),
+        ));
+        return false;
+    }
+    if ratio >= config.context_warn_ratio {
+        let pct = (ratio * 100.0).round() as usize;
+        let _ = tx.send(AppEvent::ContextWarning(format!(
+            "Context is ~{pct}% full (~{estimated} / {} estimated tokens). \
+             Consider pressing Ctrl+L to clear soon.",
+            config.context_max_tokens
+        )));
+    }
+    true
+}
+
 fn spawn_send_message(app: &App, tx: UnboundedSender<AppEvent>, text: String) {
     let client = app.http_client.clone();
     let config = app.config.clone();
     let conversation = app.conversation.clone();
     let working_dir = app.working_dir.clone();
-    tokio::spawn(async move {
-        let (outcome, conv) =
-            app::send_message(client, config, conversation, working_dir, text).await;
-        let _ = tx.send(AppEvent::LlmResponse(outcome, conv));
-    });
+
+    if !check_context(&config, &conversation, &tx) {
+        return;
+    }
+
+    if config.streaming_enabled {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let (outcome, conv) =
+                app::send_message_streaming(client, config, conversation, working_dir, text, tx2.clone())
+                    .await;
+            let _ = tx2.send(AppEvent::StreamComplete(outcome, conv));
+        });
+    } else {
+        tokio::spawn(async move {
+            let (outcome, conv) =
+                app::send_message(client, config, conversation, working_dir, text).await;
+            let _ = tx.send(AppEvent::LlmResponse(outcome, conv));
+        });
+    }
 }
 
 fn spawn_confirm_tool(app: &App, tx: UnboundedSender<AppEvent>, approved: bool) {
@@ -251,11 +338,28 @@ fn spawn_confirm_tool(app: &App, tx: UnboundedSender<AppEvent>, approved: bool) 
     let config = app.config.clone();
     let working_dir = app.working_dir.clone();
     let conversation = app.conversation.clone();
-    tokio::spawn(async move {
-        let (outcome, conv) =
-            app::confirm_tool(client, config, working_dir, conversation, pending, approved).await;
-        let _ = tx.send(AppEvent::LlmResponse(outcome, conv));
-    });
+
+    // Only check context when the user approves (cancellation never hits the LLM).
+    if approved && !check_context(&config, &conversation, &tx) {
+        return;
+    }
+
+    if config.streaming_enabled {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let (outcome, conv) =
+                app::confirm_tool_streaming(client, config, working_dir, conversation, pending, approved, tx2.clone())
+                    .await;
+            let _ = tx2.send(AppEvent::StreamComplete(outcome, conv));
+        });
+    } else {
+        tokio::spawn(async move {
+            let (outcome, conv) =
+                app::confirm_tool(client, config, working_dir, conversation, pending, approved)
+                    .await;
+            let _ = tx.send(AppEvent::LlmResponse(outcome, conv));
+        });
+    }
 }
 
 // ── Textarea helpers ──────────────────────────────────────────────────────────
@@ -276,7 +380,12 @@ fn update_textarea_style(textarea: &mut TextArea, app: &App) {
         widgets::{Block, Borders},
     };
 
-    let (title, style) = if app.is_loading {
+    let (title, style) = if app.streaming_text.is_some() {
+        (
+            " Streaming... ",
+            Style::default().fg(ratatui::style::Color::DarkGray),
+        )
+    } else if app.is_loading {
         (
             " Waiting for response... ",
             Style::default().fg(ratatui::style::Color::DarkGray),

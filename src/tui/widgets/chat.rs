@@ -63,6 +63,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 Style::default().fg(Color::Red),
             ),
+            ChatRole::Warning => (
+                " Warn ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Yellow),
+            ),
         };
 
         let content_lines: Vec<&str> = entry.content.lines().collect();
@@ -91,7 +98,41 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(""));
     }
 
-    if app.is_loading {
+    if let Some(text) = &app.streaming_text {
+        let prefix_style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        let content_style = Style::default().fg(Color::White);
+        let content_lines: Vec<&str> = text.lines().collect();
+
+        if content_lines.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(" AI   ", prefix_style),
+                Span::raw("│ "),
+                Span::styled("▌", content_style),
+            ]));
+        } else {
+            for (i, line) in content_lines.iter().enumerate() {
+                let is_last = i == content_lines.len() - 1;
+                let mut spans = if i == 0 {
+                    vec![
+                        Span::styled(" AI   ", prefix_style),
+                        Span::raw("│ "),
+                        Span::styled(*line, content_style),
+                    ]
+                } else {
+                    vec![
+                        Span::raw("       │ "),
+                        Span::styled(*line, content_style),
+                    ]
+                };
+                if is_last {
+                    spans.push(Span::styled("▌", content_style));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+    } else if app.is_loading {
         lines.push(Line::from(vec![
             Span::styled(
                 " AI   ",
@@ -109,7 +150,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    let total = lines.len() as u16;
+    // Compute actual display rows accounting for line wrapping.
+    let col_width = (inner.width.max(1)) as usize;
+    let total: u16 = lines
+        .iter()
+        .map(|line| {
+            let w = line.width();
+            if w == 0 { 1usize } else { w.div_ceil(col_width) }
+        })
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16;
+
     let visible = inner.height;
     // auto-scroll offset: keeps bottom visible when chat_scroll == 0
     let bottom_offset = total.saturating_sub(visible);

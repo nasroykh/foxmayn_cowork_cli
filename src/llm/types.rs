@@ -142,6 +142,20 @@ pub struct RequestReasoning {
     pub summary: Option<ReasoningSummaryVerbosity>,
 }
 
+/// A single event from a streaming LLM response.
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    ContentDelta(String),
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_fragment: String,
+    },
+    Done,
+    Error(String),
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
     pub model: String,

@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use tokio::sync::mpsc;
+
 use crate::config::Config;
 use crate::error::AppError;
 use crate::fs::FileEntry;
 use crate::llm;
 use crate::llm::tools::{ToolCallResult, dispatch_tool_call, execute_tool, tool_definitions};
-use crate::llm::types::{ChatRequest, FunctionCall, Message, ToolCall};
+use crate::llm::types::{ChatRequest, FunctionCall, Message, StreamChunk, ToolCall};
 
 // ── File tree display type ────────────────────────────────────────────────────
 
@@ -55,6 +57,7 @@ pub enum ChatRole {
     Assistant,
     Tool,
     Error,
+    Warning,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,12 @@ pub enum AppEvent {
         parent_path: String,
         result: Result<Vec<FileEntry>, AppError>,
     },
+    /// A single streamed content delta — forwarded live during streaming.
+    StreamChunk(StreamChunk),
+    /// Streaming round complete — carry the final outcome and updated conversation.
+    StreamComplete(LlmOutcome, Vec<Message>),
+    /// Near-context-limit warning to display in chat before proceeding.
+    ContextWarning(String),
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -119,6 +128,8 @@ pub struct App {
     pub pending_confirmation: Option<PendingToolCall>,
     pub health_status: bool,
     pub is_loading: bool,
+    /// Accumulates streaming text while a response is in progress. `None` when idle.
+    pub streaming_text: Option<String>,
     pub chat_scroll: usize,
     pub file_tree_scroll: usize,
     pub focused_panel: Panel,
@@ -138,6 +149,7 @@ impl App {
             pending_confirmation: None,
             health_status: false,
             is_loading: false,
+            streaming_text: None,
             chat_scroll: 0,
             file_tree_scroll: 0,
             focused_panel: Panel::Chat,
@@ -152,6 +164,20 @@ impl App {
             content: text.to_owned(),
         });
         self.is_loading = true;
+    }
+
+    /// Append a streamed content delta and auto-scroll to bottom.
+    pub fn handle_stream_chunk(&mut self, chunk: &StreamChunk) {
+        if let StreamChunk::ContentDelta(text) = chunk {
+            let buf = self.streaming_text.get_or_insert_with(String::new);
+            buf.push_str(text);
+            self.chat_scroll = 0;
+        }
+    }
+
+    /// Clear the streaming buffer (called when StreamComplete arrives).
+    pub fn finalize_stream(&mut self) {
+        self.streaming_text = None;
     }
 
     /// Apply the result of a completed send_message or confirm_tool task.
@@ -380,6 +406,14 @@ impl App {
 // They return (LlmOutcome, updated_conversation) so the event loop can apply
 // the result back to App without any shared mutable state.
 
+// ── Streaming helpers ─────────────────────────────────────────────────────────
+
+struct PartialToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
 /// If `user_message_for_pending` is non-empty, it is used in `LlmOutcome::PendingConfirmation`
 /// (new user turn from `send_message`). Otherwise, the most recent `user` turn in
 /// `conversation` is used (e.g. after a confirmed tool).
@@ -545,6 +579,203 @@ async fn run_agentic_loop(
     )
 }
 
+/// Streaming variant of `run_agentic_loop`. Forwards `ContentDelta` chunks to `tx`
+/// as they arrive so the TUI can render them incrementally.
+#[allow(clippy::too_many_arguments)]
+async fn run_agentic_loop_streaming(
+    client: &reqwest::Client,
+    config: &Config,
+    base_path: &Path,
+    mut working: Vec<Message>,
+    mut conversation: Vec<Message>,
+    new_user: Option<Message>,
+    user_message_for_pending: String,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) -> (LlmOutcome, Vec<Message>) {
+    let mut user_in_conversation = new_user.is_none();
+    const MAX_TOOL_ROUNDS: usize = 10;
+
+    for _ in 0..MAX_TOOL_ROUNDS {
+        let request = ChatRequest {
+            model: config.model.clone(),
+            messages: working.clone(),
+            tools: tool_definitions(),
+            stream: true,
+            reasoning: config.openrouter_reasoning.clone(),
+            think: config.ollama_think,
+        };
+
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<StreamChunk>();
+
+        if let Err(e) = llm::chat_stream(client, &request, config, chunk_tx).await {
+            return (
+                LlmOutcome::Error {
+                    message: e.to_string(),
+                },
+                conversation,
+            );
+        }
+
+        let mut content = String::new();
+        let mut partial_tool_calls: Vec<PartialToolCall> = Vec::new();
+
+        loop {
+            match chunk_rx.recv().await {
+                None => break,
+                Some(StreamChunk::ContentDelta(text)) => {
+                    content.push_str(&text);
+                    let _ = tx.send(AppEvent::StreamChunk(StreamChunk::ContentDelta(text)));
+                }
+                Some(StreamChunk::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments_fragment,
+                }) => {
+                    while partial_tool_calls.len() <= index {
+                        partial_tool_calls.push(PartialToolCall {
+                            id: None,
+                            name: None,
+                            arguments: String::new(),
+                        });
+                    }
+                    let ptc = &mut partial_tool_calls[index];
+                    if id.is_some() {
+                        ptc.id = id;
+                    }
+                    if name.is_some() {
+                        ptc.name = name;
+                    }
+                    ptc.arguments.push_str(&arguments_fragment);
+                }
+                Some(StreamChunk::Done) => break,
+                Some(StreamChunk::Error(e)) => {
+                    return (LlmOutcome::Error { message: e }, conversation);
+                }
+            }
+        }
+
+        let has_tool_calls = !partial_tool_calls.is_empty();
+        let assembled_tool_calls: Option<Vec<ToolCall>> = if has_tool_calls {
+            Some(
+                partial_tool_calls
+                    .iter()
+                    .map(|ptc| {
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(&ptc.arguments).unwrap_or_default();
+                        ToolCall {
+                            id: ptc.id.clone(),
+                            function: FunctionCall {
+                                name: ptc.name.clone().unwrap_or_default(),
+                                arguments,
+                            },
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let assistant_msg = Message {
+            role: "assistant".into(),
+            content: content.clone(),
+            tool_calls: assembled_tool_calls.clone(),
+            name: None,
+            tool_call_id: None,
+        };
+
+        if !has_tool_calls {
+            if content.trim().is_empty() {
+                return (
+                    LlmOutcome::Error {
+                        message: "The model returned an empty response. Try being more specific, or break the task into smaller steps.".into(),
+                    },
+                    conversation,
+                );
+            }
+            if !user_in_conversation && let Some(m) = new_user.as_ref() {
+                conversation.push(m.clone());
+            }
+            conversation.push(assistant_msg);
+            return (
+                LlmOutcome::Complete {
+                    assistant_message: content,
+                    tool_results: vec![],
+                },
+                conversation,
+            );
+        }
+
+        let tool_calls = assembled_tool_calls.unwrap_or_default();
+        let mut dispatched: Vec<ToolCallResult> = Vec::new();
+
+        for tc in &tool_calls {
+            let r = match dispatch_tool_call(&tc.function, base_path).await {
+                Ok(r) => r,
+                Err(AppError::ToolValidation(msg)) => ToolCallResult {
+                    result: Some(format!(
+                        "Error: {msg}. Use a relative path (e.g. 'src/file.rs') instead of an absolute path."
+                    )),
+                    requires_confirmation: false,
+                    description: format!("Validation failed: {msg}"),
+                    tool_name: tc.function.name.clone(),
+                    args: tc.function.arguments.clone(),
+                },
+                Err(e) => {
+                    return (
+                        LlmOutcome::Error {
+                            message: e.to_string(),
+                        },
+                        conversation,
+                    );
+                }
+            };
+
+            if r.requires_confirmation {
+                if !user_in_conversation && let Some(m) = new_user.as_ref() {
+                    conversation.push(m.clone());
+                }
+                conversation.push(assistant_msg.clone());
+                return (
+                    LlmOutcome::PendingConfirmation {
+                        description: r.description,
+                        tool_name: r.tool_name,
+                        arguments: r.args,
+                        tool_call_id: tc.id.clone(),
+                        user_message: last_user_for_pending(
+                            &user_message_for_pending,
+                            &conversation,
+                        ),
+                    },
+                    conversation,
+                );
+            }
+            dispatched.push(r);
+        }
+
+        if !user_in_conversation && let Some(m) = new_user.as_ref() {
+            conversation.push(m.clone());
+            user_in_conversation = true;
+        }
+        working.push(assistant_msg.clone());
+        conversation.push(assistant_msg);
+        for (tc, result) in tool_calls.iter().zip(dispatched.iter()) {
+            let s = result.result.clone().unwrap_or_default();
+            let tmsg = Message::tool_result(&tc.function.name, &s, tc.id.clone());
+            working.push(tmsg.clone());
+            conversation.push(tmsg);
+        }
+    }
+
+    (
+        LlmOutcome::Error {
+            message: "Maximum tool round limit reached (too many back-to-back tool calls).".into(),
+        },
+        conversation,
+    )
+}
+
 pub async fn send_message(
     client: reqwest::Client,
     config: Config,
@@ -636,6 +867,105 @@ pub async fn confirm_tool(
         conversation,
         None,
         String::new(),
+    )
+    .await
+}
+
+pub async fn send_message_streaming(
+    client: reqwest::Client,
+    config: Config,
+    conversation: Vec<Message>,
+    working_dir: Option<PathBuf>,
+    user_message: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> (LlmOutcome, Vec<Message>) {
+    if working_dir.is_none() {
+        return (
+            LlmOutcome::Error {
+                message: "Please select a working directory first.".into(),
+            },
+            conversation,
+        );
+    }
+
+    let base_path = working_dir.as_ref().unwrap().clone();
+    let user_msg = Message::user(&user_message);
+    let mut working: Vec<Message> = vec![Message::system(system_prompt(&working_dir))];
+    working.extend(conversation.iter().cloned());
+    working.push(user_msg.clone());
+
+    run_agentic_loop_streaming(
+        &client,
+        &config,
+        base_path.as_path(),
+        working,
+        conversation,
+        Some(user_msg),
+        user_message,
+        &tx,
+    )
+    .await
+}
+
+pub async fn confirm_tool_streaming(
+    client: reqwest::Client,
+    config: Config,
+    working_dir: Option<PathBuf>,
+    mut conversation: Vec<Message>,
+    pending: PendingToolCall,
+    approved: bool,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> (LlmOutcome, Vec<Message>) {
+    if !approved {
+        return (
+            LlmOutcome::Complete {
+                assistant_message: "Operation cancelled.".into(),
+                tool_results: vec![],
+            },
+            conversation,
+        );
+    }
+
+    let base_path = match &working_dir {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                LlmOutcome::Error {
+                    message: "No working directory set.".into(),
+                },
+                conversation,
+            );
+        }
+    };
+
+    let call = FunctionCall {
+        name: pending.tool_name.clone(),
+        arguments: pending.arguments,
+    };
+
+    let result_str = match execute_tool(&call, &base_path).await {
+        Ok(s) => s,
+        Err(e) => format!("Error: {e}"),
+    };
+
+    conversation.push(Message::tool_result(
+        &pending.tool_name,
+        &result_str,
+        pending.tool_call_id,
+    ));
+
+    let mut working: Vec<Message> = vec![Message::system(system_prompt(&working_dir))];
+    working.extend(conversation.iter().cloned());
+
+    run_agentic_loop_streaming(
+        &client,
+        &config,
+        base_path.as_path(),
+        working,
+        conversation,
+        None,
+        String::new(),
+        &tx,
     )
     .await
 }

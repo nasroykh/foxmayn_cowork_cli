@@ -25,6 +25,12 @@ pub struct Config {
     /// Set when `PROVIDER=ollama`. Sent as `think` on `/api/chat` (separate from OpenRouter
     /// `reasoning`). `None` = omit the field (`OLLAMA_THINK=off`).
     pub ollama_think: Option<OllamaThink>,
+    /// Stream tokens as they arrive. Disabled by `STREAMING=false/0/off`. Default: `true`.
+    pub streaming_enabled: bool,
+    /// Estimated token ceiling for the conversation. `0` disables the guard.
+    pub context_max_tokens: usize,
+    /// Fraction of `context_max_tokens` at which a warning is shown (e.g. `0.80`).
+    pub context_warn_ratio: f64,
 }
 
 /// Builds [`RequestReasoning`] for OpenRouter. `OPENROUTER_REASONING_EFFORT=off` (or empty) omits
@@ -107,6 +113,17 @@ impl Config {
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into()),
             openrouter_reasoning,
             ollama_think,
+            streaming_enabled: std::env::var("STREAMING")
+                .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "off"))
+                .unwrap_or(true),
+            context_max_tokens: std::env::var("CONTEXT_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128_000),
+            context_warn_ratio: std::env::var("CONTEXT_WARN_RATIO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.80),
         }
     }
 
