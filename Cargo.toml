@@ -2,6 +2,12 @@
 name = "foxmayn_cowork_cli"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal UI for AI-assisted file management"
+repository = "https://github.com/nasroykh/foxmayn_cowork_cli"
+
+[[bin]]
+name = "foxmayn-cowork"
+path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"

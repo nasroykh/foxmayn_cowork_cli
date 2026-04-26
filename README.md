@@ -12,6 +12,35 @@ A terminal UI for AI-assisted file management. Chat with an LLM to inspect and c
 - File tree navigation: expand/collapse subdirectories and keep expanded paths across automatic refreshes.
 - Context guard: warns before the conversation approaches the configured token budget.
 
+## Install
+
+**Linux & macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nasroykh/foxmayn_cowork_cli/main/install.sh | sh
+```
+
+Installs to `/usr/local/bin` (or `~/.local/bin` as a fallback).
+
+**Windows (PowerShell):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/nasroykh/foxmayn_cowork_cli/main/install.ps1 | iex"
+```
+
+Both scripts detect your OS/architecture, download the correct binary from the latest GitHub Release, and verify the SHA256 checksum before installing.
+
+**Manually** — download a pre-built binary from the [Releases page](https://github.com/nasroykh/foxmayn_cowork_cli/releases).
+
+**From source:**
+
+```bash
+git clone https://github.com/nasroykh/foxmayn_cowork_cli.git
+cd foxmayn_cowork_cli
+cargo build --release
+# binary: target/release/foxmayn-cowork
+```
+
 ## Providers
 
 Supports **OpenRouter** (default) and **Ollama**. The default model is `google/gemini-2.5-flash-lite`.
