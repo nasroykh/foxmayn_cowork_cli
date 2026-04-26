@@ -1211,6 +1211,10 @@ fn system_prompt(working_dir: &Option<PathBuf>) -> String {
         - For small targeted changes, prefer `patch_file` (search & replace a unique string) over `edit_file` (full overwrite).\n\
         - `patch_file` fails if the search text appears 0 or more than once — fall back to `edit_file` in that case.\n\
         \n\
+        FINDING FILES:\n\
+        - To list or find files by name or extension (e.g. 'list all .md files', 'find all .rs files'), use `find_files` with a `filename_regex` such as '\\.md$'.\n\
+        - Do NOT use `list_files` recursively or `search_in_files` for this — `list_files` is single-directory only and `search_in_files` greps file contents, not filenames.\n\
+        \n\
         MULTI-STEP OPERATIONS:\n\
         - For tasks that affect multiple known paths, prefer bulk tools (`delete_many`, `rename_many`) over repeated single-file calls.\n\
         - For filename-pattern tasks (e.g. 'delete all .md files' or 'rename .jpeg to .jpg'), prefer `delete_matching` or `rename_matching` so the user sees one confirmation.\n\

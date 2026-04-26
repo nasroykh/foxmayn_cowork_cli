@@ -219,13 +219,29 @@ pub fn tool_definitions() -> Vec<Tool> {
         Tool {
             r#type: "function".into(),
             function: ToolFunction {
+                name: "find_files".into(),
+                description: "Find files whose filename matches a regex under a directory. Use this to list files by extension (e.g. '\\.md$', '\\.rs$') or name pattern. Returns matching file paths. Skips hidden directories and build artifacts.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory to search. Prefer relative paths. Relative paths are resolved against the working directory." },
+                        "filename_regex": { "type": "string", "description": "Regex applied to each filename (not the full path), e.g. '\\\\.md$' or '^README'." },
+                        "recursive": { "type": "boolean", "description": "Whether to scan subdirectories. Defaults to false." }
+                    },
+                    "required": ["path", "filename_regex"]
+                }),
+            },
+        },
+        Tool {
+            r#type: "function".into(),
+            function: ToolFunction {
                 name: "search_in_files".into(),
-                description: "Search for a regex pattern in all files under a directory. Returns matching lines with file paths and line numbers. Skips hidden directories and build artifacts.".into(),
+                description: "Search for a regex pattern inside the contents of all files under a directory. Returns matching lines with file paths and line numbers. Use this for grep-style content search, not for finding files by name — use find_files for that. Skips hidden directories and build artifacts.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Directory to search in. Prefer relative paths. Relative paths are resolved against the working directory." },
-                        "pattern": { "type": "string", "description": "Regex pattern to search for (e.g. 'fn main', 'TODO', 'error\\(')" }
+                        "pattern": { "type": "string", "description": "Regex pattern to search for in file contents (e.g. 'fn main', 'TODO', 'error\\(')" }
                     },
                     "required": ["path", "pattern"]
                 }),
@@ -476,6 +492,7 @@ pub async fn dispatch_tool_call(
         "rename_matching",
         "create_directory",
         "copy_file",
+        "find_files",
         "search_in_files",
         "patch_file",
     ];
@@ -616,6 +633,22 @@ pub async fn execute_tool(call: &FunctionCall, base_path: &Path) -> Result<Strin
                 .into_owned();
             crate::fs::copy_file(resolved_src, resolved_dst).await?;
             Ok("File copied successfully".into())
+        }
+        "find_files" => {
+            let path = extract_str(args, "path")?;
+            let filename_regex = extract_str(args, "filename_regex")?;
+            let recursive = extract_bool(args, "recursive");
+            let resolved = validate_path_containment(&path, base_path)?
+                .to_string_lossy()
+                .into_owned();
+            let matches =
+                crate::fs::matching_files(resolved, filename_regex, recursive, MAX_BULK_MATCHES)
+                    .await?;
+            if matches.is_empty() {
+                Ok("No matching files found.".into())
+            } else {
+                Ok(matches.join("\n"))
+            }
         }
         "search_in_files" => {
             let path = extract_str(args, "path")?;
@@ -827,6 +860,13 @@ fn build_description(call: &FunctionCall) -> String {
             args.get("destination")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
+        ),
+        "find_files" => format!(
+            "Find files matching /{}/ in {}",
+            args.get("filename_regex")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?"),
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         "search_in_files" => format!(
             "Search for '{}' in {}",
