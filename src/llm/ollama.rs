@@ -90,17 +90,15 @@ async fn process_ndjson_stream(response: reqwest::Response, tx: UnboundedSender<
                 continue;
             };
 
-            if let Some(msg) = &parsed.message
-                && let Some(content) = &msg.content
-                && !content.is_empty()
-            {
-                let _ = tx.send(StreamChunk::ContentDelta(content.clone()));
-            }
-
-            if parsed.done {
-                if let Some(msg) = parsed.message
-                    && let Some(tool_calls) = msg.tool_calls
+            if let Some(msg) = &parsed.message {
+                if let Some(content) = &msg.content
+                    && !content.is_empty()
                 {
+                    let _ = tx.send(StreamChunk::ContentDelta(content.clone()));
+                }
+                // Tool calls may arrive on a done:false line (e.g. qwen3 thinking models)
+                // or on the done:true line (other models). Handle both.
+                if let Some(tool_calls) = &msg.tool_calls {
                     for (idx, tc) in tool_calls.iter().enumerate() {
                         let _ = tx.send(StreamChunk::ToolCallDelta {
                             index: idx,
@@ -110,6 +108,9 @@ async fn process_ndjson_stream(response: reqwest::Response, tx: UnboundedSender<
                         });
                     }
                 }
+            }
+
+            if parsed.done {
                 let _ = tx.send(StreamChunk::Done);
                 return;
             }

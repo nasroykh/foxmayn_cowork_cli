@@ -40,6 +40,20 @@ pub fn tool_definitions() -> Vec<Tool> {
         Tool {
             r#type: "function".into(),
             function: ToolFunction {
+                name: "read_pdf".into(),
+                description: "Extract and return the text content of a PDF file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path to the PDF file. Prefer relative paths (e.g. 'docs/report.pdf'). Relative paths are resolved against the working directory." }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        Tool {
+            r#type: "function".into(),
+            function: ToolFunction {
                 name: "create_file".into(),
                 description: "Create a new file with content. Fails if the file already exists."
                     .into(),
@@ -451,6 +465,7 @@ pub async fn dispatch_tool_call(
     let known_tools = [
         "list_files",
         "read_file",
+        "read_pdf",
         "create_file",
         "edit_file",
         "delete_file",
@@ -514,6 +529,13 @@ pub async fn execute_tool(call: &FunctionCall, base_path: &Path) -> Result<Strin
                 .to_string_lossy()
                 .into_owned();
             crate::fs::read_file(resolved).await
+        }
+        "read_pdf" => {
+            let path = extract_str(args, "path")?;
+            let resolved = validate_path_containment(&path, base_path)?
+                .to_string_lossy()
+                .into_owned();
+            crate::fs::read_pdf(resolved).await
         }
         "create_file" => {
             let path = extract_str(args, "path")?;
@@ -744,6 +766,10 @@ fn build_description(call: &FunctionCall) -> String {
         ),
         "read_file" => format!(
             "Read file {}",
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
+        "read_pdf" => format!(
+            "Read PDF {}",
             args.get("path").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         "create_file" => format!(

@@ -4,7 +4,7 @@ A terminal UI for AI-assisted file management. Chat with an LLM to inspect and c
 
 ## Features
 
-- File tools: list, read, create, overwrite, delete, rename, create directories, copy files, search file contents, and patch files with search/replace.
+- File tools: list, read, create, overwrite, delete, rename, create directories, copy files, search file contents, patch files with search/replace, and extract text from PDF files.
 - Bulk operations: delete or rename many explicit paths, and delete or rename files by filename regex with a single confirmation.
 - Safety boundary: all tool paths are validated against the selected working directory; destructive operations, including rename/move and bulk operations, require `y` confirmation.
 - Agentic loops: the model can call tools over multiple rounds, then summarize what it did.
@@ -71,6 +71,15 @@ Environment variables are read from `.env` when present. CLI flags override matc
 | `OPENROUTER_REASONING_EFFORT` | `minimal` | `xhigh`, `high`, `medium`, `low`, `minimal`, `none`, or `off` |
 | `OPENROUTER_REASONING_SUMMARY` | none | `auto`, `concise`, or `detailed` |
 | `OLLAMA_THINK` | `low` | `true`, `false`, `high`, `medium`, `low`, or `off` |
+
+## Debug / probe mode
+
+The `probe` subcommand sends a single message directly to the Ollama HTTP API and prints the raw JSON request, response, and any tool round-trips to stdout without starting the TUI. Useful for diagnosing provider issues or iterating on tool schemas.
+
+```bash
+foxmayn-cowork probe "list all .md files"          # uses cwd, default message
+foxmayn-cowork probe "summarise report.pdf" --dir /path/to/dir
+```
 
 ## Development
 

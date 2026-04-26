@@ -45,6 +45,24 @@ pub async fn read_file(path: String) -> Result<String, AppError> {
     Ok(content)
 }
 
+pub async fn read_pdf(path: String) -> Result<String, AppError> {
+    const MAX_PDF_BYTES: u64 = 52_428_800; // 50 MB
+    let metadata = fs::metadata(&path).await?;
+    if metadata.len() > MAX_PDF_BYTES {
+        return Err(AppError::ToolValidation(format!(
+            "PDF is too large ({} bytes, max 50 MB)",
+            metadata.len()
+        )));
+    }
+    let bytes = tokio::fs::read(&path).await?;
+    tokio::task::spawn_blocking(move || {
+        pdf_extract::extract_text_from_mem(&bytes)
+            .map_err(|e| AppError::ToolValidation(format!("Failed to extract PDF text: {e}")))
+    })
+    .await
+    .map_err(|e| AppError::ToolValidation(format!("PDF extraction task failed: {e}")))?
+}
+
 pub async fn create_file(path: String, content: String) -> Result<(), AppError> {
     if fs::try_exists(&path).await? {
         return Err(AppError::ToolValidation(format!(

@@ -3,7 +3,7 @@ use std::str::FromStr;
 use clap::ValueEnum;
 
 use crate::llm::types::{
-    OllamaThink, OllamaThinkLevel, ReasoningEffort, ReasoningSummaryVerbosity, RequestReasoning,
+    OllamaThink, ReasoningEffort, ReasoningSummaryVerbosity, RequestReasoning,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
@@ -76,19 +76,22 @@ fn openrouter_reasoning_from_env() -> Option<RequestReasoning> {
     Some(RequestReasoning { effort, summary })
 }
 
-/// Ollama `think` per <https://docs.ollama.com/api/chat> — `off` omits the field. Unset defaults
-/// to `low` (closest to OpenRouter’s “minimal” effort; Ollama has no `minimal` string).
+/// Ollama `think` per <https://docs.ollama.com/api/chat>. Omitted by default so non-thinking
+/// models are not broken. Set OLLAMA_THINK=low|medium|high|true to enable for thinking models.
 fn ollama_think_from_env() -> Option<OllamaThink> {
-    match std::env::var("OLLAMA_THINK") {
-        Ok(s) if s.is_empty() || s.eq_ignore_ascii_case("off") => None,
-        Ok(s) => match s.parse::<OllamaThink>() {
-            Ok(t) => Some(t),
-            Err(e) => {
-                eprintln!("[config] OLLAMA_THINK: {e} — using low");
-                Some(OllamaThink::Level(OllamaThinkLevel::Low))
-            }
-        },
-        Err(_) => Some(OllamaThink::Level(OllamaThinkLevel::Low)),
+    let val = match std::env::var("OLLAMA_THINK") {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    if val.is_empty() || val.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    match val.parse::<OllamaThink>() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("[config] OLLAMA_THINK: {e} -- omitting think field");
+            None
+        }
     }
 }
 
