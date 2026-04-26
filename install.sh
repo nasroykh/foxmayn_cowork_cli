@@ -4,6 +4,26 @@ set -e
 REPO="nasroykh/foxmayn_cowork_cli"
 BINARY="foxmayn-cowork"
 
+# --- auth header ---
+# Prefer GITHUB_TOKEN env var; fall back to `gh auth token` if gh is installed.
+if [ -z "$GITHUB_TOKEN" ] && command -v gh > /dev/null 2>&1; then
+  GITHUB_TOKEN=$(gh auth token 2>/dev/null || true)
+fi
+
+AUTH_HEADER=""
+if [ -n "$GITHUB_TOKEN" ]; then
+  AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
+fi
+
+# Helper: curl with optional auth
+fetch() {
+  if [ -n "$AUTH_HEADER" ]; then
+    curl -fsSL -H "$AUTH_HEADER" "$@"
+  else
+    curl -fsSL "$@"
+  fi
+}
+
 # --- detect OS ---
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$OS" in
@@ -39,12 +59,14 @@ case "${OS}_${ARCH}" in
 esac
 
 # --- resolve latest release tag ---
-VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+VERSION=$(fetch "https://api.github.com/repos/${REPO}/releases/latest" \
   | grep '"tag_name"' \
   | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 
 if [ -z "$VERSION" ]; then
   echo "Could not determine latest release version." >&2
+  echo "If the repo is private, make sure gh is installed and you are logged in (gh auth login)," >&2
+  echo "or set GITHUB_TOKEN before running this script." >&2
   exit 1
 fi
 
@@ -58,8 +80,8 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 # --- download archive + checksum ---
-curl -fsSL "$URL" -o "$TMP/$ARCHIVE"
-curl -fsSL "$CHECKSUM_URL" -o "$TMP/${ARCHIVE}.sha256"
+fetch "$URL" -o "$TMP/$ARCHIVE"
+fetch "$CHECKSUM_URL" -o "$TMP/${ARCHIVE}.sha256"
 
 # --- verify checksum ---
 cd "$TMP"
