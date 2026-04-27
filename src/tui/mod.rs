@@ -363,10 +363,10 @@ fn restore_pending_expansions(app: &mut App, tx: &UnboundedSender<AppEvent>) {
 // ── Async task spawners ───────────────────────────────────────────────────────
 
 fn spawn_health_check(app: &App, tx: UnboundedSender<AppEvent>) {
-    let client = app.http_client.clone();
+    let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
     tokio::spawn(async move {
-        let ok = llm::health_check(&client, &config).await;
+        let ok = llm::health_check(&runtime, &config).await;
         let _ = tx.send(AppEvent::HealthCheckResult(ok));
     });
 }
@@ -426,7 +426,7 @@ fn check_context(
 }
 
 fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String) {
-    let client = app.http_client.clone();
+    let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
     let conversation = app.conversation.clone();
     let working_dir = app.working_dir.clone();
@@ -440,7 +440,7 @@ fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String
         let tx2 = tx.clone();
         let h = tokio::spawn(async move {
             let (outcome, conv) = app::send_message_streaming(
-                client,
+                runtime,
                 config,
                 conversation,
                 working_dir,
@@ -459,7 +459,7 @@ fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String
     } else {
         let h = tokio::spawn(async move {
             let (outcome, conv) =
-                app::send_message(client, config, conversation, working_dir, text).await;
+                app::send_message(runtime, config, conversation, working_dir, text).await;
             let _ = tx.send(AppEvent::LlmResponse {
                 request_id: Some(request_id),
                 outcome,
@@ -474,7 +474,7 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
     let Some(pending) = app.pending_confirmation.clone() else {
         return;
     };
-    let client = app.http_client.clone();
+    let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
     let working_dir = app.working_dir.clone();
     let conversation = app.conversation.clone();
@@ -489,7 +489,7 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
         let tx2 = tx.clone();
         let h = tokio::spawn(async move {
             let (outcome, conv) = app::confirm_tool_streaming(
-                client,
+                runtime,
                 config,
                 working_dir,
                 conversation,
@@ -509,7 +509,7 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
     } else {
         let h = tokio::spawn(async move {
             let (outcome, conv) =
-                app::confirm_tool(client, config, working_dir, conversation, pending, approved)
+                app::confirm_tool(runtime, config, working_dir, conversation, pending, approved)
                     .await;
             let _ = tx.send(AppEvent::LlmResponse {
                 request_id: Some(request_id),

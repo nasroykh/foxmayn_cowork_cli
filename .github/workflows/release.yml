@@ -22,6 +22,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  check-local-feature:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            cmake_install: brew install cmake
+          - os: ubuntu-latest
+            cmake_install: sudo apt-get install -y cmake
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install cmake (required by llama-cpp-2 build script)
+        run: ${{ matrix.cmake_install }}
+      - name: cargo check --features local
+        run: cargo check --features local
+
   upload-assets:
     needs: create-release
     strategy:

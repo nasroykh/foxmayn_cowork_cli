@@ -37,26 +37,55 @@ Both scripts detect your OS/architecture, download the correct binary from the l
 ```bash
 git clone https://github.com/nasroykh/foxmayn_cowork_cli.git
 cd foxmayn_cowork_cli
-cargo build --release
+cargo build --release                           # OpenRouter / Ollama
+cargo build --release --features local          # + offline local inference (CPU)
+cargo build --release --features local-metal    # + Metal GPU (macOS)
+cargo build --release --features local-cuda     # + CUDA GPU (NVIDIA)
 # binary: target/release/foxmayn-cowork
 ```
 
 ## Providers
 
-Supports **OpenRouter** (default) and **Ollama**. The default model is `google/gemini-2.5-flash-lite`.
+| Provider | Requires | Notes |
+| --- | --- | --- |
+| `openrouter` (default) | `OPENROUTER_API_KEY` | Cloud; default model `google/gemini-2.5-flash-lite` |
+| `ollama` | Running Ollama server | Local server; any model pulled via `ollama pull` |
+| `local` | Build with `--features local` | Fully offline; downloads a GGUF from HuggingFace on first run |
 
 ## Setup
 
+**OpenRouter (default):**
+
 ```bash
 just env
-# Fill in OPENROUTER_API_KEY, or set PROVIDER=ollama for a local Ollama server.
+# Fill in OPENROUTER_API_KEY in .env
 just run dir=/path/to/dir
 ```
 
-Ollama example:
+**Ollama:**
 
 ```bash
 just run-ollama dir=/path/to/dir
+```
+
+**Local (fully offline, no API key or Ollama needed):**
+
+```bash
+# One-time: install cmake (required to compile llama.cpp)
+brew install cmake          # macOS
+sudo apt install cmake      # Linux
+
+just run-local dir=/path/to/dir
+```
+
+On first run the default model (`Qwen/Qwen2.5-1.5B-Instruct-GGUF`) is downloaded from HuggingFace into `~/.cache/huggingface/hub/` and reused on every subsequent launch. Set `LOCAL_MODEL_PATH` to use a GGUF file you already have on disk. GPU offload is off by default; set `LOCAL_GPU_LAYERS` to a non-zero value and build with `--features local-metal` (macOS) or `--features local-cuda` (NVIDIA) to enable it.
+
+**From source with local inference:**
+
+```bash
+cargo build --release --features local
+# binary: target/release/foxmayn-cowork
+PROVIDER=local ./target/release/foxmayn-cowork --dir /path/to/dir
 ```
 
 ## Usage
@@ -88,8 +117,8 @@ Environment variables are read from `.env` when present. CLI flags override matc
 
 | Variable / Flag | Default | Description |
 | --- | --- | --- |
-| `PROVIDER`, `--provider` | `openrouter` | `openrouter` or `ollama` |
-| `MODEL`, `--model` | `google/gemini-2.5-flash-lite` | Model name |
+| `PROVIDER`, `--provider` | `openrouter` | `openrouter`, `ollama`, or `local` |
+| `MODEL`, `--model` | `google/gemini-2.5-flash-lite` | Model name (OpenRouter/Ollama) |
 | `OPENROUTER_API_KEY` | none | Required for OpenRouter |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter-compatible endpoint |
@@ -100,6 +129,19 @@ Environment variables are read from `.env` when present. CLI flags override matc
 | `OPENROUTER_REASONING_EFFORT` | `minimal` | `xhigh`, `high`, `medium`, `low`, `minimal`, `none`, or `off` |
 | `OPENROUTER_REASONING_SUMMARY` | none | `auto`, `concise`, or `detailed` |
 | `OLLAMA_THINK` | `low` | `true`, `false`, `high`, `medium`, `low`, or `off` |
+
+**Local provider variables** (only relevant when `PROVIDER=local`, build with `--features local`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LOCAL_MODEL_REPO` | `Qwen/Qwen2.5-1.5B-Instruct-GGUF` | HuggingFace repo to download from |
+| `LOCAL_MODEL_FILE` | `qwen2.5-1.5b-instruct-q4_k_m.gguf` | Filename inside the repo |
+| `LOCAL_MODEL_PATH` | none | Use a local GGUF file directly; skips HuggingFace download |
+| `LOCAL_CONTEXT_TOKENS` | `8192` | Context window size in tokens |
+| `LOCAL_GPU_LAYERS` | `0` | Layers to offload to GPU (requires `local-metal` or `local-cuda` feature) |
+| `LOCAL_THREADS` | auto | Thread count for inference |
+| `LOCAL_MAX_OUTPUT_TOKENS` | `1024` | Maximum tokens per response |
+| `LOCAL_TEMPERATURE` | `0.1` | Sampling temperature (`0.0` = greedy) |
 
 ## Debug / probe mode
 

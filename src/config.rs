@@ -10,9 +10,12 @@ use crate::llm::types::{
 pub enum Provider {
     Ollama,
     OpenRouter,
+    /// Offline inference via llama.cpp. Requires building with `--features local`.
+    Local,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "local"), allow(dead_code))]
 pub struct Config {
     pub provider: Provider,
     pub model: String,
@@ -33,6 +36,24 @@ pub struct Config {
     pub context_max_tokens: usize,
     /// Fraction of `context_max_tokens` at which a warning is shown (e.g. `0.80`).
     pub context_warn_ratio: f64,
+
+    // ── Local provider (Provider::Local) ──────────────────────────────────────
+    /// HuggingFace repo id, e.g. `"Qwen/Qwen2.5-1.5B-Instruct-GGUF"`.
+    pub local_model_repo: String,
+    /// Filename inside the repo, e.g. `"qwen2.5-1.5b-instruct-q4_k_m.gguf"`.
+    pub local_model_file: String,
+    /// Override: use this local path directly, skip HuggingFace download.
+    pub local_model_path: Option<std::path::PathBuf>,
+    /// Context window size in tokens passed to llama.cpp.
+    pub local_context_tokens: u32,
+    /// Number of model layers to offload to GPU (0 = CPU-only).
+    pub local_gpu_layers: u32,
+    /// CPU thread count for inference (`None` = auto / llama.cpp default).
+    pub local_threads: Option<usize>,
+    /// Hard cap on generated tokens per response.
+    pub local_max_output_tokens: usize,
+    /// Sampling temperature (lower = more deterministic; 0.1 is good for tool calls).
+    pub local_temperature: f32,
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
@@ -103,6 +124,7 @@ impl Config {
             .as_str()
         {
             "ollama" => Provider::Ollama,
+            "local" => Provider::Local,
             _ => Provider::OpenRouter,
         };
 
@@ -117,6 +139,31 @@ impl Config {
         } else {
             None
         };
+
+        let local_model_repo = std::env::var("LOCAL_MODEL_REPO")
+            .unwrap_or_else(|_| "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into());
+        let local_model_file = std::env::var("LOCAL_MODEL_FILE")
+            .unwrap_or_else(|_| "qwen2.5-1.5b-instruct-q4_k_m.gguf".into());
+        let local_model_path = std::env::var("LOCAL_MODEL_PATH").ok().map(Into::into);
+        let local_context_tokens = std::env::var("LOCAL_CONTEXT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let local_gpu_layers = std::env::var("LOCAL_GPU_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let local_threads = std::env::var("LOCAL_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let local_max_output_tokens = std::env::var("LOCAL_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let local_temperature = std::env::var("LOCAL_TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.1_f32);
 
         Self {
             provider,
@@ -138,6 +185,14 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.80),
+            local_model_repo,
+            local_model_file,
+            local_model_path,
+            local_context_tokens,
+            local_gpu_layers,
+            local_threads,
+            local_max_output_tokens,
+            local_temperature,
         }
     }
 

@@ -18,6 +18,10 @@ run-ollama dir:
 run-model dir model:
     cargo run -- --dir {{dir}} --model {{model}}
 
+# Run with fully-local llama.cpp inference (no API key or Ollama needed)
+run-local dir=".":
+    cargo run --features local -- --dir {{dir}} --provider local
+
 # Same as `run` but skip all destructive-op confirmations (dangerous: AI can edit/delete/rename without prompting)
 run-unsafe dir:
     cargo run -- --dir {{dir}} --skip-confirmations

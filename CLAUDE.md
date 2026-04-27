@@ -16,6 +16,7 @@ just release        # release build
 just run dir=.      # run with a directory (required arg)
 just run-self       # run pointed at the project itself
 just run-ollama dir=.   # run with Ollama provider
+just run-local dir=.    # run with fully-offline local llama.cpp provider (requires --features local build)
 just run-model dir=. model=qwen3:0.6b  # model override
 
 just env            # copy .env.example → .env if missing
@@ -29,7 +30,7 @@ Run a single test module: `cargo test llm::types` (tests live in `src/llm/types.
 
 ## Setup
 
-Copy `.env.example` to `.env` and fill in `OPENROUTER_API_KEY`. Ollama users set `PROVIDER=ollama` and optionally `OLLAMA_BASE_URL`.
+Copy `.env.example` to `.env` and fill in `OPENROUTER_API_KEY`. Ollama users set `PROVIDER=ollama` and optionally `OLLAMA_BASE_URL`. For fully-offline inference set `PROVIDER=local` and build with `cargo run --features local` (requires `cmake` on `$PATH`).
 
 ## Architecture
 
@@ -56,7 +57,9 @@ All async work is fire-and-forget (`tokio::spawn`). Results come back through an
 - `src/tui/ui.rs` + `src/tui/widgets/` — ratatui rendering (chat panel, file tree, confirmation dialog).
 - `src/llm/tools.rs` — tool definitions sent to the LLM (`list_files`, `read_file`, `read_pdf`, `create_file`, `edit_file`, `delete_file`, and bulk/regex variants), `dispatch_tool_call` (gates destructive ops behind confirmation), `execute_tool` (executes after confirmation), path containment validation.
 - `src/llm/openrouter.rs` / `src/llm/ollama.rs` — provider-specific HTTP clients; `llm::mod.rs` dispatches to the right one based on `Config::provider`.
-- `src/config.rs` — `Config::from_env()` + `with_overrides()`, reasoning/think env var parsing.
+- `src/llm/runtime.rs` — `LlmRuntime` (cheaply-cloneable handle holding `reqwest::Client` and, when `--features local`, an `Arc<LocalRuntime>`); built once at startup in `main.rs` and cloned into every spawned task.
+- `src/llm/local.rs` — `--features local` only; `LocalRuntime` (llama.cpp backend + model loaded once), `chat` / `chat_stream` (run inference in `spawn_blocking`, bridge result to `StreamChunk` channel), `build_prompt` (ChatML format), `parse_output` (JSON tool-call detection).
+- `src/config.rs` — `Config::from_env()` + `with_overrides()`, reasoning/think env var parsing, local model env vars (`LOCAL_MODEL_REPO`, `LOCAL_MODEL_FILE`, `LOCAL_MODEL_PATH`, `LOCAL_CONTEXT_TOKENS`, `LOCAL_GPU_LAYERS`, `LOCAL_THREADS`, `LOCAL_MAX_OUTPUT_TOKENS`, `LOCAL_TEMPERATURE`).
 - `src/fs.rs` — async file-system operations called by tools; includes `read_pdf` (extracts text via `pdf-extract`, 50 MB cap, runs in `spawn_blocking`).
 
 ### Tool confirmation flow
@@ -67,7 +70,11 @@ All async work is fire-and-forget (`tokio::spawn`). Results come back through an
 
 ### LLM providers
 
-Both providers speak OpenAI-compatible tool-use JSON. `openrouter` sends `reasoning` (effort + summary verbosity). `ollama` sends `think` (bool or `high`/`medium`/`low`). Neither field is sent for the other provider. Default provider is OpenRouter with `google/gemini-2.5-flash-lite` and `reasoning.effort: "minimal"`.
+Three providers are supported, all dispatched through `llm::mod.rs` via `&LlmRuntime`:
+
+- `openrouter` — HTTP; sends `reasoning` (effort + summary verbosity). Default model `google/gemini-2.5-flash-lite` with `reasoning.effort: "minimal"`.
+- `ollama` — HTTP; sends `think` (bool or `high`/`medium`/`low`). Default endpoint `http://localhost:11434`.
+- `local` — embedded llama.cpp via the `llama-cpp-2` crate; only available when built with `--features local`. Tool schemas are injected into the system prompt in ChatML format; tool calls are detected by scanning the output for `{"name": …, "arguments": …}`. Inference runs in `tokio::task::spawn_blocking`. The model is loaded once at startup (`LocalRuntime`) and shared across requests via `Arc`. Each request creates a fresh `LlamaContext`. Requires `cmake` at build time.
 
 ### Keyboard shortcuts (runtime)
 

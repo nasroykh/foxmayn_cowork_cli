@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::fs::FileEntry;
 use crate::llm;
+use crate::llm::runtime::LlmRuntime;
 use crate::llm::tools::{ToolCallResult, dispatch_tool_call, execute_tool, tool_definitions};
 use crate::llm::types::{ChatRequest, FunctionCall, Message, StreamChunk, ToolCall};
 
@@ -148,7 +149,7 @@ pub enum AppEvent {
 
 pub struct App {
     pub config: Config,
-    pub http_client: reqwest::Client,
+    pub llm_runtime: LlmRuntime,
     pub conversation: Vec<Message>,
     pub working_dir: Option<PathBuf>,
     pub chat_messages: Vec<ChatEntry>,
@@ -179,18 +180,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
-        // Fast-fail on unreachable hosts; intentionally no overall `timeout()` so
-        // long-running streaming responses (slow Ollama models, multi-round
-        // agentic loops) aren't truncated mid-flight.
-        let http_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
+    pub fn new(config: Config, llm_runtime: LlmRuntime) -> Self {
         Self {
             config,
-            http_client,
+            llm_runtime,
             conversation: Vec::new(),
             working_dir: None,
             chat_messages: Vec::new(),
@@ -607,7 +600,7 @@ async fn apply_confirmation_policy(
 /// `None` when the transcript already contains the full user turn (e.g. right after
 /// a confirmed tool).
 async fn run_agentic_loop(
-    client: &reqwest::Client,
+    runtime: &LlmRuntime,
     config: &Config,
     base_path: &Path,
     mut working: Vec<Message>,
@@ -629,7 +622,7 @@ async fn run_agentic_loop(
             think: config.ollama_think,
         };
 
-        let assistant_msg = match llm::chat(client, &request, config).await {
+        let assistant_msg = match llm::chat(runtime, &request, config).await {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -773,7 +766,7 @@ fn format_tool_summary(description: &str, result: &str) -> String {
 /// as they arrive so the TUI can render them incrementally.
 #[allow(clippy::too_many_arguments)]
 async fn run_agentic_loop_streaming(
-    client: &reqwest::Client,
+    runtime: &LlmRuntime,
     config: &Config,
     base_path: &Path,
     mut working: Vec<Message>,
@@ -798,7 +791,7 @@ async fn run_agentic_loop_streaming(
 
         let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<StreamChunk>();
 
-        if let Err(e) = llm::chat_stream(client, &request, config, chunk_tx).await {
+        if let Err(e) = llm::chat_stream(runtime, &request, config, chunk_tx).await {
             return (
                 LlmOutcome::Error {
                     message: e.to_string(),
@@ -985,7 +978,7 @@ async fn run_agentic_loop_streaming(
 }
 
 pub async fn send_message(
-    client: reqwest::Client,
+    runtime: LlmRuntime,
     config: Config,
     conversation: Vec<Message>,
     working_dir: Option<PathBuf>,
@@ -1007,7 +1000,7 @@ pub async fn send_message(
     working.push(user_msg.clone());
 
     run_agentic_loop(
-        &client,
+        &runtime,
         &config,
         base_path.as_path(),
         working,
@@ -1019,7 +1012,7 @@ pub async fn send_message(
 }
 
 pub async fn confirm_tool(
-    client: reqwest::Client,
+    runtime: LlmRuntime,
     config: Config,
     working_dir: Option<PathBuf>,
     mut conversation: Vec<Message>,
@@ -1068,7 +1061,7 @@ pub async fn confirm_tool(
     working.extend(conversation.iter().cloned());
 
     run_agentic_loop(
-        &client,
+        &runtime,
         &config,
         base_path.as_path(),
         working,
@@ -1080,7 +1073,7 @@ pub async fn confirm_tool(
 }
 
 pub async fn send_message_streaming(
-    client: reqwest::Client,
+    runtime: LlmRuntime,
     config: Config,
     conversation: Vec<Message>,
     working_dir: Option<PathBuf>,
@@ -1104,7 +1097,7 @@ pub async fn send_message_streaming(
     working.push(user_msg.clone());
 
     run_agentic_loop_streaming(
-        &client,
+        &runtime,
         &config,
         base_path.as_path(),
         working,
@@ -1122,7 +1115,7 @@ pub async fn send_message_streaming(
     reason = "Streaming confirmation needs the pending tool, request generation, and event channel"
 )]
 pub async fn confirm_tool_streaming(
-    client: reqwest::Client,
+    runtime: LlmRuntime,
     config: Config,
     working_dir: Option<PathBuf>,
     mut conversation: Vec<Message>,
@@ -1173,7 +1166,7 @@ pub async fn confirm_tool_streaming(
     working.extend(conversation.iter().cloned());
 
     run_agentic_loop_streaming(
-        &client,
+        &runtime,
         &config,
         base_path.as_path(),
         working,

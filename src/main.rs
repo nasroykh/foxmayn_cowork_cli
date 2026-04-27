@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 
 use app::App;
 use config::{Config, Provider};
+use llm::runtime::LlmRuntime;
 
 #[derive(Parser)]
 #[command(
@@ -82,7 +83,15 @@ async fn main() {
         );
     }
 
-    let mut app = App::new(config);
+    let llm_runtime = match LlmRuntime::build(&config).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to initialize LLM runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut app = App::new(config, llm_runtime);
 
     if let Some(dir) = cli.dir {
         app.set_working_dir(dir);
@@ -108,10 +117,23 @@ fn preflight(config: &Config) -> Result<(), String> {
                 1. Add it to .env (run `just env` to copy from .env.example,\n     \
                    then fill in OPENROUTER_API_KEY=…)\n  \
                 2. Set PROVIDER=ollama (or pass --provider ollama) to use a local\n     \
-                   Ollama instance instead\n\n\
+                   Ollama instance instead\n  \
+                3. Build with --features local and set PROVIDER=local for fully\n     \
+                   offline inference (no API key required)\n\n\
              See README.md for full setup instructions."
             .to_string());
     }
+
+    if matches!(config.provider, Provider::Local) {
+        #[cfg(not(feature = "local"))]
+        return Err(
+            "Error: PROVIDER=local requires building with the `local` feature.\n\n\
+             Rebuild with:\n  cargo build --release --features local\n\n\
+             Or run directly:\n  cargo run --features local -- --provider local --dir <path>"
+                .to_string(),
+        );
+    }
+
     Ok(())
 }
 

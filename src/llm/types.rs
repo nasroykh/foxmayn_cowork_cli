@@ -156,7 +156,7 @@ pub enum StreamChunk {
     Error(String),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -232,13 +232,13 @@ pub struct FunctionCall {
     pub arguments: serde_json::Value,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub r#type: String,
     pub function: ToolFunction,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolFunction {
     pub name: String,
     pub description: String,
