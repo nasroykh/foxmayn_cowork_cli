@@ -508,9 +508,15 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
         app.current_request = Some(h);
     } else {
         let h = tokio::spawn(async move {
-            let (outcome, conv) =
-                app::confirm_tool(runtime, config, working_dir, conversation, pending, approved)
-                    .await;
+            let (outcome, conv) = app::confirm_tool(
+                runtime,
+                config,
+                working_dir,
+                conversation,
+                pending,
+                approved,
+            )
+            .await;
             let _ = tx.send(AppEvent::LlmResponse {
                 request_id: Some(request_id),
                 outcome,

@@ -54,8 +54,7 @@ impl LocalRuntime {
             let backend = LlamaBackend::init()
                 .map_err(|e| AppError::LlmError(format!("llama backend init: {e}")))?;
 
-            let model_params = LlamaModelParams::default()
-                .with_n_gpu_layers(n_gpu_layers);
+            let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
 
             let model = LlamaModel::load_from_file(&backend, &path, &model_params)
                 .map_err(|e| AppError::LlmError(format!("Model load: {e}")))?;
@@ -311,7 +310,9 @@ fn generate_blocking(
         .map_err(|e| AppError::LlmError(format!("Tokenization: {e}")))?;
 
     if tokens.is_empty() {
-        return Err(AppError::LlmError("Empty token list after tokenization".into()));
+        return Err(AppError::LlmError(
+            "Empty token list after tokenization".into(),
+        ));
     }
 
     let n_prompt = tokens.len() as i32;
@@ -390,10 +391,9 @@ fn parse_output(text: String, tools: &[crate::llm::types::Tool]) -> Result<Messa
 
     if trimmed.starts_with('{') {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let (Some(name), Some(arguments)) = (
-                v.get("name").and_then(|n| n.as_str()),
-                v.get("arguments"),
-            ) {
+            if let (Some(name), Some(arguments)) =
+                (v.get("name").and_then(|n| n.as_str()), v.get("arguments"))
+            {
                 if tools.iter().any(|t| t.function.name == name) {
                     return Ok(Message {
                         role: "assistant".into(),

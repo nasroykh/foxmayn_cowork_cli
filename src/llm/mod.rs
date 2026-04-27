@@ -28,7 +28,13 @@ pub async fn chat(
         }
         Provider::OpenRouter => {
             let key = config.openrouter_api_key.as_deref().unwrap_or("");
-            openrouter::chat(&runtime.http_client, request, &config.openrouter_base_url, key).await
+            openrouter::chat(
+                &runtime.http_client,
+                request,
+                &config.openrouter_base_url,
+                key,
+            )
+            .await
         }
         Provider::Local => {
             #[cfg(feature = "local")]
@@ -80,9 +86,7 @@ pub async fn chat_stream(
             }
             #[cfg(not(feature = "local"))]
             {
-                let _ = tx.send(StreamChunk::Error(
-                    "Built without --features local.".into(),
-                ));
+                let _ = tx.send(StreamChunk::Error("Built without --features local.".into()));
                 Ok(())
             }
         }
