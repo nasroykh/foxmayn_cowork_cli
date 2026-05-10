@@ -146,6 +146,9 @@ pub struct RequestReasoning {
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
     ContentDelta(String),
+    /// A fragment of the model's reasoning / thinking trace. Surfaced separately from `ContentDelta`
+    /// so the TUI can render or ignore it independently of the main answer.
+    ThinkingDelta(String),
     ToolCallDelta {
         index: usize,
         id: Option<String>,
@@ -223,12 +226,24 @@ impl Message {
 pub struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// OpenAI/OpenRouter wire format requires `"type": "function"` in every tool call.
+    /// Default lets us deserialize messages that omit it (e.g. from our own internal storage).
+    #[serde(rename = "type", default = "ToolCall::type_function")]
+    pub r#type: String,
     pub function: FunctionCall,
+}
+
+impl ToolCall {
+    fn type_function() -> String {
+        "function".to_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
+    /// Stored and serialized as a JSON Value (object). OpenRouter needs this converted to a
+    /// JSON *string* before sending — see `openrouter::args_to_string_in_request`.
     pub arguments: serde_json::Value,
 }
 

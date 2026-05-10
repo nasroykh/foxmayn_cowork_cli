@@ -55,26 +55,33 @@ All async work is fire-and-forget (`tokio::spawn`). Results come back through an
 - `src/app.rs` — `App` struct (all UI state), `run_agentic_loop` (drives LLM ↔ tool loop up to 10 rounds), `send_message` / `confirm_tool` (entry points for async tasks), `LlmOutcome` / `AppEvent` enums.
 - `src/tui/mod.rs` — terminal setup/teardown, `run_loop` event multiplexer (`tokio::select!` over crossterm events, mpsc channel, and a 10-second health-check tick).
 - `src/tui/ui.rs` + `src/tui/widgets/` — ratatui rendering (chat panel, file tree, confirmation dialog).
-- `src/llm/tools.rs` — tool definitions sent to the LLM (`list_files`, `read_file`, `read_pdf`, `create_file`, `edit_file`, `delete_file`, and bulk/regex variants), `dispatch_tool_call` (gates destructive ops behind confirmation), `execute_tool` (executes after confirmation), path containment validation.
+- `src/llm/tools.rs` — tool definitions sent to the LLM (`list_files`, `read_file`, `read_pdf`, `find_files`, `search_in_files`, `create_file`, `create_directory`, `copy_file`, `edit_file`, `patch_file`, `delete_file`, `delete_many`, `delete_matching`, `rename_file`, `rename_many`, `rename_matching`), `dispatch_tool_call` (gates destructive ops behind confirmation), `execute_tool` (executes after confirmation), `build_description` / `brief_action` (used by the chat-panel display verbosity), path containment validation.
 - `src/llm/openrouter.rs` / `src/llm/ollama.rs` — provider-specific HTTP clients; `llm::mod.rs` dispatches to the right one based on `Config::provider`.
 - `src/llm/runtime.rs` — `LlmRuntime` (cheaply-cloneable handle holding `reqwest::Client` and, when `--features local`, an `Arc<LocalRuntime>`); built once at startup in `main.rs` and cloned into every spawned task.
 - `src/llm/local.rs` — `--features local` only; `LocalRuntime` (llama.cpp backend + model loaded once), `chat` / `chat_stream` (run inference in `spawn_blocking`, bridge result to `StreamChunk` channel), `build_prompt` (ChatML format), `parse_output` (JSON tool-call detection).
-- `src/config.rs` — `Config::from_env()` + `with_overrides()`, reasoning/think env var parsing, local model env vars (`LOCAL_MODEL_REPO`, `LOCAL_MODEL_FILE`, `LOCAL_MODEL_PATH`, `LOCAL_CONTEXT_TOKENS`, `LOCAL_GPU_LAYERS`, `LOCAL_THREADS`, `LOCAL_MAX_OUTPUT_TOKENS`, `LOCAL_TEMPERATURE`).
+- `src/config.rs` — `Config::from_env()` + `with_overrides()`, reasoning/think env var parsing, display-verbosity env vars (`TOOL_DISPLAY_VERBOSITY`, `THINKING_DISPLAY`), local model env vars (`LOCAL_MODEL_REPO`, `LOCAL_MODEL_FILE`, `LOCAL_MODEL_PATH`, `LOCAL_CONTEXT_TOKENS`, `LOCAL_GPU_LAYERS`, `LOCAL_THREADS`, `LOCAL_MAX_OUTPUT_TOKENS`, `LOCAL_TEMPERATURE`).
 - `src/fs.rs` — async file-system operations called by tools; includes `read_pdf` (extracts text via `pdf-extract`, 50 MB cap, runs in `spawn_blocking`).
 
 ### Tool confirmation flow
 
-`delete_file` and `edit_file` are in `DESTRUCTIVE_OPS`. When the LLM calls one, `dispatch_tool_call` returns `requires_confirmation: true` without executing. The TUI enters `InputMode::Confirming` and shows a confirmation widget. Pressing `y` calls `confirm_tool → execute_tool`; `n`/Esc cancels and returns `"Operation cancelled."` as a plain assistant message.
+`DESTRUCTIVE_OPS` (in `src/llm/tools.rs`) currently covers: `delete_file`, `delete_many`, `delete_matching`, `edit_file`, `patch_file`, `rename_file`, `rename_many`, `rename_matching`. When the LLM calls one, `dispatch_tool_call` returns `requires_confirmation: true` without executing. The TUI enters `InputMode::Confirming` and shows a confirmation widget. Pressing `y` calls `confirm_tool → execute_tool`; `n`/Esc cancels and returns `"Operation cancelled."` as a plain assistant message. With `--skip-confirmations` / `SKIP_CONFIRMATIONS=true`, `apply_confirmation_policy` executes the call inline and tags the description as `"… (confirmation skipped)"`.
 
-`read_pdf` is non-destructive and never requires confirmation.
+Read-only tools (`list_files`, `read_file`, `read_pdf`, `find_files`, `search_in_files`) and pure-creation tools (`create_file`, `create_directory`, `copy_file`) never require confirmation.
 
 ### LLM providers
 
 Three providers are supported, all dispatched through `llm::mod.rs` via `&LlmRuntime`:
 
-- `openrouter` — HTTP; sends `reasoning` (effort + summary verbosity). Default model `google/gemini-2.5-flash-lite` with `reasoning.effort: "minimal"`.
-- `ollama` — HTTP; sends `think` (bool or `high`/`medium`/`low`). Default endpoint `http://localhost:11434`.
+- `openrouter` — HTTP; sends `reasoning` (effort + summary verbosity). Default model `google/gemini-2.5-flash-lite` with `reasoning.effort: "minimal"`. Outgoing requests go through `to_openrouter_body` which converts each `tool_calls[].function.arguments` from a JSON object to a JSON string (OpenAI/Google AI Studio reject the object form). Streamed `delta.reasoning` is forwarded as `StreamChunk::ThinkingDelta`.
+- `ollama` — HTTP; sends `think` (bool or `high`/`medium`/`low`). Default endpoint `http://localhost:11434`. Keeps `arguments` as a JSON object on the wire. Streamed `message.thinking` is forwarded as `StreamChunk::ThinkingDelta`.
 - `local` — embedded llama.cpp via the `llama-cpp-2` crate; only available when built with `--features local`. Tool schemas are injected into the system prompt in ChatML format; tool calls are detected by scanning the output for `{"name": …, "arguments": …}`. Inference runs in `tokio::task::spawn_blocking`. The model is loaded once at startup (`LocalRuntime`) and shared across requests via `Arc`. Each request creates a fresh `LlamaContext`. Requires `cmake` at build time.
+
+### Tool / thinking display
+
+Two env vars control how live activity is rendered in the chat panel:
+
+- `TOOL_DISPLAY_VERBOSITY` (`default` | `minimal` | `full`) — handled by `format_tool_summary` in `src/app.rs`, used by both streaming (`AppEvent::IntermediateTool`) and non-streaming (`LlmOutcome::Complete.tool_results`) paths so they emit identical `[name] …` lines. `default` uses `brief_action(tool_name)` from `tools.rs`; `minimal` uses `build_description`; `full` appends a result snippet capped at `TOOL_DISPLAY_FULL_RESULT_CAP`.
+- `THINKING_DISPLAY` (`off` | `inline` | `full`) — `App::thinking_text: Option<String>` accumulates `StreamChunk::ThinkingDelta` fragments; `App::finalize_thinking_for_round` is called at every round boundary (`IntermediateAssistant`, `IntermediateTool`, `StreamComplete`) and is idempotent. `inline` shows a dimmed `[Thinking… (N chars)]` line above the streaming buffer and discards on finalize; `full` streams reasoning live and pushes a permanent `ChatRole::Thinking` entry on finalize.
 
 ### Keyboard shortcuts (runtime)
 

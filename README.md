@@ -11,6 +11,8 @@ A terminal UI for AI-assisted file management. Chat with an LLM to inspect and c
 - Streaming responses: tokens render as they arrive by default, including intermediate tool-round progress.
 - File tree navigation: expand/collapse subdirectories and keep expanded paths across automatic refreshes.
 - Context guard: warns before the conversation approaches the configured token budget.
+- Tool display verbosity: pick how detailed each Tool entry is in chat — brief action, parametrized description, or description plus a capped result snippet.
+- Reasoning visibility: optionally surface the model's thinking tokens as a live indicator or a permanent dimmed transcript entry.
 
 ## Install
 
@@ -129,6 +131,8 @@ Environment variables are read from `.env` when present. CLI flags override matc
 | `OPENROUTER_REASONING_EFFORT` | `minimal` | `xhigh`, `high`, `medium`, `low`, `minimal`, `none`, or `off` |
 | `OPENROUTER_REASONING_SUMMARY` | none | `auto`, `concise`, or `detailed` |
 | `OLLAMA_THINK` | `low` | `true`, `false`, `high`, `medium`, `low`, or `off` |
+| `TOOL_DISPLAY_VERBOSITY` | `default` | `default` (name + brief action), `minimal` (name + description with args), or `full` (name + description + capped result snippet) |
+| `THINKING_DISPLAY` | `off` | `off` (discard), `inline` (live `[Thinking… (N chars)]` indicator), or `full` (stream reasoning live and keep it in chat). Requires a thinking model with reasoning enabled via `OPENROUTER_REASONING_EFFORT` / `OLLAMA_THINK` |
 
 **Local provider variables** (only relevant when `PROVIDER=local`, build with `--features local`):
 

@@ -797,6 +797,30 @@ async fn build_confirmation_description(
     }
 }
 
+/// Short, user-friendly action for a tool name. Used by the `Default` display verbosity.
+/// No arguments, no result — just what the tool conceptually did.
+pub fn brief_action(tool_name: &str) -> &'static str {
+    match tool_name {
+        "list_files" => "Listed directory",
+        "read_file" => "Read file",
+        "read_pdf" => "Read PDF",
+        "create_file" => "Created file",
+        "edit_file" => "Overwrote file",
+        "delete_file" => "Deleted item",
+        "delete_many" => "Deleted items",
+        "rename_file" => "Renamed item",
+        "rename_many" => "Renamed items",
+        "delete_matching" => "Deleted matching files",
+        "rename_matching" => "Renamed matching files",
+        "create_directory" => "Created directory",
+        "copy_file" => "Copied file",
+        "find_files" => "Searched for files",
+        "search_in_files" => "Searched file contents",
+        "patch_file" => "Patched file",
+        _ => "Ran tool",
+    }
+}
+
 fn build_description(call: &FunctionCall) -> String {
     let args = &call.arguments;
     match call.name.as_str() {

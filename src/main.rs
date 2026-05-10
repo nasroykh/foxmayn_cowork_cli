@@ -243,6 +243,7 @@ async fn probe(config: Config, message: String, dir: PathBuf) {
                                 .unwrap_or(serde_json::Value::Object(Default::default()));
                             llm::types::ToolCall {
                                 id: None,
+                                r#type: "function".to_string(),
                                 function: llm::types::FunctionCall { name, arguments },
                             }
                         })

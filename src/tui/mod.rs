@@ -296,7 +296,9 @@ fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEven
                 return;
             }
             // Flush the live streaming buffer to a permanent chat entry so
-            // subsequent rounds don't overwrite this round's text.
+            // subsequent rounds don't overwrite this round's text. Promote any thinking
+            // collected during this round first so it appears above the assistant turn.
+            app.finalize_thinking_for_round();
             app.streaming_text = None;
             if !content.trim().is_empty() {
                 app.chat_messages.push(app::ChatEntry {
@@ -313,10 +315,15 @@ fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEven
             if !app.is_active_request(request_id) {
                 return;
             }
+            // For rounds that produced only tool calls (no assistant text) the thinking buffer
+            // hasn't been finalized yet — do it here. Idempotent if already done.
+            app.finalize_thinking_for_round();
+            // `result` is already a complete `[name] ...` line built by `format_tool_summary`.
+            // Fall back to a bare `[name]` if it somehow arrived empty.
             let display = if result.is_empty() {
                 format!("[{name}]")
             } else {
-                format!("[{name}] {result}")
+                result
             };
             app.chat_messages.push(app::ChatEntry {
                 role: app::ChatRole::Tool,

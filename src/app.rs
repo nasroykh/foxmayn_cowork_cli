@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::config::Config;
+use crate::config::{Config, TOOL_DISPLAY_FULL_RESULT_CAP, ThinkingDisplay, ToolDisplayVerbosity};
 use crate::error::AppError;
 use crate::fs::FileEntry;
 use crate::llm;
 use crate::llm::runtime::LlmRuntime;
-use crate::llm::tools::{ToolCallResult, dispatch_tool_call, execute_tool, tool_definitions};
+use crate::llm::tools::{
+    ToolCallResult, brief_action, dispatch_tool_call, execute_tool, tool_definitions,
+};
 use crate::llm::types::{ChatRequest, FunctionCall, Message, StreamChunk, ToolCall};
 
 pub type RequestId = u64;
@@ -61,6 +63,8 @@ pub enum ChatRole {
     User,
     Assistant,
     Tool,
+    /// Permanent dimmed entry used by `ThinkingDisplay::Full` to keep reasoning in the transcript.
+    Thinking,
     Error,
     Warning,
 }
@@ -160,6 +164,9 @@ pub struct App {
     pub is_loading: bool,
     /// Accumulates streaming text while a response is in progress. `None` when idle.
     pub streaming_text: Option<String>,
+    /// Accumulates streamed reasoning / thinking text for the current round. Rendered or
+    /// finalized based on `Config::thinking_display`. `None` when no reasoning has arrived.
+    pub thinking_text: Option<String>,
     pub chat_scroll: usize,
     pub file_tree_scroll: usize,
     pub focused_panel: Panel,
@@ -193,6 +200,7 @@ impl App {
             health_status: false,
             is_loading: false,
             streaming_text: None,
+            thinking_text: None,
             chat_scroll: 0,
             file_tree_scroll: 0,
             focused_panel: Panel::Chat,
@@ -286,6 +294,7 @@ impl App {
         self.active_request_id = None;
         self.is_loading = false;
         self.streaming_text = None;
+        self.thinking_text = None;
         self.input_mode = InputMode::Editing;
         self.pending_confirmation = None;
         self.chat_messages.push(ChatEntry {
@@ -304,18 +313,51 @@ impl App {
         self.is_loading = true;
     }
 
-    /// Append a streamed content delta and auto-scroll to bottom.
+    /// Append a streamed content / thinking delta and auto-scroll to bottom.
+    /// Thinking deltas are dropped when `ThinkingDisplay::Off` so we never carry useless state.
     pub fn handle_stream_chunk(&mut self, chunk: &StreamChunk) {
-        if let StreamChunk::ContentDelta(text) = chunk {
-            let buf = self.streaming_text.get_or_insert_with(String::new);
-            buf.push_str(text);
-            self.chat_scroll = 0;
+        match chunk {
+            StreamChunk::ContentDelta(text) => {
+                let buf = self.streaming_text.get_or_insert_with(String::new);
+                buf.push_str(text);
+                self.chat_scroll = 0;
+            }
+            StreamChunk::ThinkingDelta(text) => {
+                if matches!(self.config.thinking_display, ThinkingDisplay::Off) {
+                    return;
+                }
+                let buf = self.thinking_text.get_or_insert_with(String::new);
+                buf.push_str(text);
+                self.chat_scroll = 0;
+            }
+            _ => {}
         }
+    }
+
+    /// Promote / discard the thinking buffer for the round that just finished, based on
+    /// `Config::thinking_display`. Called whenever the live response is sealed (round end,
+    /// stream complete, or non-streaming outcome). Idempotent — safe to call repeatedly.
+    pub fn finalize_thinking_for_round(&mut self) {
+        let Some(text) = self.thinking_text.take() else {
+            return;
+        };
+        if !matches!(self.config.thinking_display, ThinkingDisplay::Full) {
+            return;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.chat_messages.push(ChatEntry {
+            role: ChatRole::Thinking,
+            content: trimmed.to_string(),
+        });
     }
 
     /// Clear the streaming buffer (called when StreamComplete arrives).
     pub fn finalize_stream(&mut self) {
         self.streaming_text = None;
+        self.finalize_thinking_for_round();
     }
 
     /// Apply the result of a completed send_message or confirm_tool task.
@@ -517,6 +559,8 @@ impl App {
         self.conversation.clear();
         self.chat_messages.clear();
         self.pending_confirmation = None;
+        self.streaming_text = None;
+        self.thinking_text = None;
         self.input_mode = InputMode::Editing;
     }
 
@@ -838,7 +882,12 @@ async fn run_agentic_loop(
         conversation.push(assistant_msg);
         for (tc, result) in tool_calls.iter().zip(dispatched.iter()) {
             let s = result.result.clone().unwrap_or_default();
-            tool_summaries.push(format_tool_summary(&result.description, &s));
+            tool_summaries.push(format_tool_summary(
+                &tc.function.name,
+                &result.description,
+                &s,
+                config.tool_display_verbosity,
+            ));
             let tmsg = Message::tool_result(&tc.function.name, &s, tc.id.clone());
             working.push(tmsg.clone());
             conversation.push(tmsg);
@@ -853,23 +902,34 @@ async fn run_agentic_loop(
     )
 }
 
-/// Build a one-line tool summary suitable for display in the chat panel.
-/// Truncates the result so a long file listing doesn't dominate the UI.
-fn format_tool_summary(description: &str, result: &str) -> String {
-    let trimmed = result.trim();
-    let first_line = trimmed.lines().next().unwrap_or("").trim();
-    let max = 120;
-    let summary: String = if first_line.chars().count() <= max {
-        first_line.to_string()
-    } else {
-        let mut s: String = first_line.chars().take(max - 1).collect();
-        s.push('…');
-        s
-    };
-    if summary.is_empty() {
-        description.to_string()
-    } else {
-        format!("{description} → {summary}")
+/// Build the full chat-panel line for a tool entry, honouring the user's verbosity setting.
+/// Always prefixed with `[tool_name]`; subsequent renderers should not add another prefix.
+fn format_tool_summary(
+    tool_name: &str,
+    description: &str,
+    result: &str,
+    verbosity: ToolDisplayVerbosity,
+) -> String {
+    match verbosity {
+        ToolDisplayVerbosity::Default => format!("[{tool_name}] {}", brief_action(tool_name)),
+        ToolDisplayVerbosity::Minimal => format!("[{tool_name}] {description}"),
+        ToolDisplayVerbosity::Full => {
+            let trimmed = result.trim();
+            let first_line = trimmed.lines().next().unwrap_or("").trim();
+            let cap = TOOL_DISPLAY_FULL_RESULT_CAP;
+            let snippet: String = if first_line.chars().count() <= cap {
+                first_line.to_string()
+            } else {
+                let mut s: String = first_line.chars().take(cap.saturating_sub(1)).collect();
+                s.push('…');
+                s
+            };
+            if snippet.is_empty() {
+                format!("[{tool_name}] {description}")
+            } else {
+                format!("[{tool_name}] {description} → {snippet}")
+            }
+        }
     }
 }
 
@@ -924,6 +984,12 @@ async fn run_agentic_loop_streaming(
                         chunk: StreamChunk::ContentDelta(text),
                     });
                 }
+                Some(StreamChunk::ThinkingDelta(text)) => {
+                    let _ = tx.send(AppEvent::StreamChunk {
+                        request_id,
+                        chunk: StreamChunk::ThinkingDelta(text),
+                    });
+                }
                 Some(StreamChunk::ToolCallDelta {
                     index,
                     id,
@@ -963,6 +1029,7 @@ async fn run_agentic_loop_streaming(
                             serde_json::from_str(&ptc.arguments).unwrap_or_default();
                         ToolCall {
                             id: ptc.id.clone(),
+                            r#type: "function".to_string(),
                             function: FunctionCall {
                                 name: ptc.name.clone().unwrap_or_default(),
                                 arguments,
@@ -1065,7 +1132,12 @@ async fn run_agentic_loop_streaming(
             let _ = tx.send(AppEvent::IntermediateTool {
                 request_id,
                 name: tc.function.name.clone(),
-                result: format_tool_summary(&result.description, &s),
+                result: format_tool_summary(
+                    &tc.function.name,
+                    &result.description,
+                    &s,
+                    config.tool_display_verbosity,
+                ),
             });
             let tmsg = Message::tool_result(&tc.function.name, &s, tc.id.clone());
             working.push(tmsg.clone());

@@ -400,6 +400,7 @@ fn parse_output(text: String, tools: &[crate::llm::types::Tool]) -> Result<Messa
                         content: String::new(),
                         tool_calls: Some(vec![ToolCall {
                             id: Some("local_call_0".into()),
+                            r#type: "function".to_string(),
                             function: FunctionCall {
                                 name: name.to_string(),
                                 arguments: arguments.clone(),

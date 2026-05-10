@@ -35,6 +35,28 @@ struct OpenRouterFunctionCall {
     arguments: String,
 }
 
+/// OpenRouter (OpenAI format) requires `tool_calls[].function.arguments` to be a JSON *string*,
+/// not an object. Our internal `FunctionCall` stores it as a `Value`, so we fix it up here.
+fn to_openrouter_body(request: &ChatRequest) -> serde_json::Value {
+    let mut body = serde_json::to_value(request).unwrap_or_default();
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in messages.iter_mut() {
+            if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                for tc in tool_calls.iter_mut() {
+                    if let Some(args) = tc
+                        .get_mut("function")
+                        .and_then(|f| f.get_mut("arguments"))
+                        && !args.is_string()
+                    {
+                        *args = serde_json::Value::String(args.to_string());
+                    }
+                }
+            }
+        }
+    }
+    body
+}
+
 pub async fn chat(
     client: &reqwest::Client,
     request: &ChatRequest,
@@ -48,7 +70,7 @@ pub async fn chat(
         .header("Authorization", format!("Bearer {api_key}"))
         .header("HTTP-Referer", "https://foxmayn.com")
         .header("X-Title", "Foxmayn CoWork")
-        .json(request)
+        .json(&to_openrouter_body(request))
         .send()
         .await?;
 
@@ -85,6 +107,9 @@ struct SseChoice {
 #[derive(Debug, Deserialize)]
 struct SseDelta {
     content: Option<String>,
+    /// OpenRouter forwards reasoning text from providers that expose it (e.g. OpenAI o-series,
+    /// Anthropic extended thinking, Gemini thinking). Surfaced as `StreamChunk::ThinkingDelta`.
+    reasoning: Option<String>,
     tool_calls: Option<Vec<SseToolCallDelta>>,
 }
 
@@ -137,6 +162,11 @@ async fn process_sse_stream(response: reqwest::Response, tx: UnboundedSender<Str
                     continue;
                 };
                 let delta = choice.delta;
+                if let Some(reasoning) = delta.reasoning
+                    && !reasoning.is_empty()
+                {
+                    let _ = tx.send(StreamChunk::ThinkingDelta(reasoning));
+                }
                 if let Some(content) = delta.content
                     && !content.is_empty()
                 {
@@ -176,7 +206,7 @@ pub async fn chat_stream(
         .header("Authorization", format!("Bearer {api_key}"))
         .header("HTTP-Referer", "https://foxmayn.com")
         .header("X-Title", "Foxmayn CoWork")
-        .json(request)
+        .json(&to_openrouter_body(request))
         .send()
         .await?;
 
@@ -218,6 +248,7 @@ fn normalize(msg: OpenRouterMessage) -> Result<Message, AppError> {
                         })?;
                     Ok(ToolCall {
                         id: Some(tc.id),
+                        r#type: "function".to_string(),
                         function: FunctionCall {
                             name: tc.function.name,
                             arguments,

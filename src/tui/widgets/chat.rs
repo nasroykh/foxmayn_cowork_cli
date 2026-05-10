@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, ChatRole};
+use crate::config::ThinkingDisplay;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let title = match &app.working_dir {
@@ -58,6 +59,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
                 Style::default().fg(Color::DarkGray),
             ),
+            ChatRole::Thinking => (
+                " Think",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
             ChatRole::Error => (
                 " Err  ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -96,6 +106,56 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         }
 
         lines.push(Line::from(""));
+    }
+
+    if let Some(thinking) = &app.thinking_text
+        && !matches!(app.config.thinking_display, ThinkingDisplay::Off)
+    {
+        let prefix_style = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+        let content_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+
+        match app.config.thinking_display {
+            ThinkingDisplay::Inline => {
+                let label = format!("[Thinking… ({} chars)]", thinking.chars().count());
+                lines.push(Line::from(vec![
+                    Span::styled(" Think", prefix_style),
+                    Span::raw("│ "),
+                    Span::styled(label, content_style),
+                ]));
+            }
+            ThinkingDisplay::Full => {
+                let content_lines: Vec<&str> = thinking.lines().collect();
+                if content_lines.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(" Think", prefix_style),
+                        Span::raw("│ "),
+                        Span::styled("▌", content_style),
+                    ]));
+                } else {
+                    for (i, line) in content_lines.iter().enumerate() {
+                        let is_last = i == content_lines.len() - 1;
+                        let mut spans = if i == 0 {
+                            vec![
+                                Span::styled(" Think", prefix_style),
+                                Span::raw("│ "),
+                                Span::styled(*line, content_style),
+                            ]
+                        } else {
+                            vec![Span::raw("       │ "), Span::styled(*line, content_style)]
+                        };
+                        if is_last {
+                            spans.push(Span::styled("▌", content_style));
+                        }
+                        lines.push(Line::from(spans));
+                    }
+                }
+            }
+            ThinkingDisplay::Off => {}
+        }
     }
 
     if let Some(text) = &app.streaming_text {

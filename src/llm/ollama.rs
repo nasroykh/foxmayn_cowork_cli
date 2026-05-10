@@ -61,6 +61,8 @@ struct NdjsonLine {
 #[derive(Debug, Deserialize)]
 struct NdjsonMessage {
     content: Option<String>,
+    /// Ollama emits reasoning chunks under `thinking` when `think` is enabled on a thinking model.
+    thinking: Option<String>,
     tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
@@ -91,6 +93,11 @@ async fn process_ndjson_stream(response: reqwest::Response, tx: UnboundedSender<
             };
 
             if let Some(msg) = &parsed.message {
+                if let Some(thinking) = &msg.thinking
+                    && !thinking.is_empty()
+                {
+                    let _ = tx.send(StreamChunk::ThinkingDelta(thinking.clone()));
+                }
                 if let Some(content) = &msg.content
                     && !content.is_empty()
                 {
@@ -159,6 +166,7 @@ fn normalize(msg: OllamaMessage) -> Message {
             .into_iter()
             .map(|tc| ToolCall {
                 id: None,
+                r#type: "function".to_string(),
                 function: FunctionCall {
                     name: tc.function.name,
                     arguments: tc.function.arguments,

@@ -14,6 +14,63 @@ pub enum Provider {
     Local,
 }
 
+/// Controls how much detail is shown for a Tool chat entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDisplayVerbosity {
+    /// `[tool_name] Brief action` — no arguments, no result. Cleanest for end users.
+    Default,
+    /// `[tool_name] Description with args` — adds the parameters.
+    Minimal,
+    /// `[tool_name] Description with args → result snippet (capped)` — for technical users.
+    Full,
+}
+
+impl FromStr for ToolDisplayVerbosity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "minimal" => Ok(Self::Minimal),
+            "full" => Ok(Self::Full),
+            other => Err(format!(
+                "unknown TOOL_DISPLAY_VERBOSITY: {other} (expected default, minimal, or full)"
+            )),
+        }
+    }
+}
+
+/// Cap on the result snippet length appended in `Full` mode.
+pub const TOOL_DISPLAY_FULL_RESULT_CAP: usize = 240;
+
+/// Controls whether the model's reasoning / thinking tokens are surfaced to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDisplay {
+    /// Discard thinking tokens silently (default).
+    Off,
+    /// Show a single dimmed `[Thinking… (N chars)]` line while reasoning is in flight; clear it
+    /// once content / tool calls arrive. Nothing is kept in the chat history.
+    Inline,
+    /// Stream thinking tokens live like the assistant text and keep a permanent dimmed
+    /// "Thinking" entry in the chat once the round finishes.
+    Full,
+}
+
+impl FromStr for ThinkingDisplay {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "false" | "0" | "no" => Ok(Self::Off),
+            "inline" => Ok(Self::Inline),
+            "full" => Ok(Self::Full),
+            other => Err(format!(
+                "unknown THINKING_DISPLAY: {other} (expected off, inline, or full)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "local"), allow(dead_code))]
 pub struct Config {
@@ -54,6 +111,12 @@ pub struct Config {
     pub local_max_output_tokens: usize,
     /// Sampling temperature (lower = more deterministic; 0.1 is good for tool calls).
     pub local_temperature: f32,
+
+    /// How much detail to show for Tool chat entries.
+    pub tool_display_verbosity: ToolDisplayVerbosity,
+
+    /// Whether/how to surface model reasoning tokens in the TUI.
+    pub thinking_display: ThinkingDisplay,
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
@@ -95,6 +158,34 @@ fn openrouter_reasoning_from_env() -> Option<RequestReasoning> {
         };
 
     Some(RequestReasoning { effort, summary })
+}
+
+fn thinking_display_from_env() -> ThinkingDisplay {
+    let val = match std::env::var("THINKING_DISPLAY") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return ThinkingDisplay::Off,
+    };
+    match val.parse::<ThinkingDisplay>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[config] {e} — using off");
+            ThinkingDisplay::Off
+        }
+    }
+}
+
+fn tool_display_verbosity_from_env() -> ToolDisplayVerbosity {
+    let val = match std::env::var("TOOL_DISPLAY_VERBOSITY") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return ToolDisplayVerbosity::Default,
+    };
+    match val.parse::<ToolDisplayVerbosity>() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[config] {e} — using default");
+            ToolDisplayVerbosity::Default
+        }
+    }
 }
 
 /// Ollama `think` per <https://docs.ollama.com/api/chat>. Omitted by default so non-thinking
@@ -193,6 +284,8 @@ impl Config {
             local_threads,
             local_max_output_tokens,
             local_temperature,
+            tool_display_verbosity: tool_display_verbosity_from_env(),
+            thinking_display: thinking_display_from_env(),
         }
     }
 
