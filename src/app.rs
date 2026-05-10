@@ -571,6 +571,124 @@ fn last_user_for_pending(user_message_for_pending: &str, conversation: &[Message
     }
 }
 
+/// Format any tool error for the model with a category-specific recovery hint.
+/// Generic enough to handle ToolValidation, filesystem IO, regex compile, etc.
+/// The LLM sees this as the tool result and is expected to either fix its
+/// arguments and retry, or — if the error is unrecoverable (permission, etc.) —
+/// report it back to the user in plain text.
+fn format_tool_error(msg: &str) -> String {
+    let lower = msg.to_ascii_lowercase();
+
+    if lower.contains("path '")
+        || lower.contains("outside the working directory")
+        || lower.contains("'..' components")
+        || lower.contains("working directory not accessible")
+    {
+        return format!(
+            "Error: {msg}\n\
+             Hint: paths must be relative (e.g. 'src/main.rs'). Use '.' to refer to the working \
+             directory root. Do not use '..' or absolute paths from outside the working directory."
+        );
+    }
+
+    if lower.contains("missing required argument") || lower.contains("missing required array") {
+        return format!(
+            "Error: {msg}\n\
+             Hint: this is NOT a path-format problem. Re-read the tool's parameter list and \
+             include EVERY required argument on the next call."
+        );
+    }
+
+    if lower.contains("invalid regex") || lower.contains("invalid filename regex") {
+        return format!(
+            "Error: {msg}\n\
+             Hint: escape special characters (use '\\\\.md$' to match files ending in .md) and \
+             ensure the regex is valid Rust regex syntax."
+        );
+    }
+
+    if lower.contains("no such file") || lower.contains("not found") || lower.contains("nosuchfile")
+    {
+        return format!(
+            "Error: {msg}\n\
+             Hint: the path does not exist. Verify with `find_files` or `list_files` before \
+             retrying. Do not guess a different path — if you cannot locate the file, ask the user."
+        );
+    }
+
+    if lower.contains("already exists") {
+        return format!(
+            "Error: {msg}\n\
+             Hint: the destination is occupied. Either choose a different path, or — if the user's \
+             intent was to modify the existing file — use `patch_file` or `edit_file` instead."
+        );
+    }
+
+    if lower.contains("permission denied") || lower.contains("access is denied") {
+        return format!(
+            "Error: {msg}\n\
+             Hint: this is a system permission error and cannot be fixed by retrying. Stop and \
+             report it to the user in plain text."
+        );
+    }
+
+    if lower.contains("matched files but produced no filename changes")
+        || lower.contains("no files matched")
+    {
+        return format!(
+            "Error: {msg}\n\
+             Hint: your pattern did not match anything actionable. Either widen the regex or \
+             confirm with the user that there is anything to do."
+        );
+    }
+
+    if lower.contains("must appear exactly once") || lower.contains("does not appear in") {
+        return format!(
+            "Error: {msg}\n\
+             Hint: `patch_file` needs a search string that appears EXACTLY ONCE. Read the file \
+             with `read_file` first, then choose a longer/more unique substring. If the change \
+             is broad, use `edit_file` instead."
+        );
+    }
+
+    format!(
+        "Error: {msg}\nHint: review the tool description and arguments, then either retry with corrected input or report the issue to the user."
+    )
+}
+
+/// Build a compact top-level listing of `base_path` to embed in the system
+/// prompt as ground-truth context for the model. Capped so we don't blow up
+/// the prompt on large directories.
+async fn working_dir_summary(base_path: &Path) -> String {
+    let path = base_path.to_string_lossy().into_owned();
+    match crate::fs::list_files(path).await {
+        Ok(entries) if entries.is_empty() => "(empty directory)".to_string(),
+        Ok(entries) => {
+            const MAX: usize = 40;
+            let total = entries.len();
+            let mut lines: Vec<String> = entries
+                .iter()
+                .take(MAX)
+                .map(|e| {
+                    if e.is_dir {
+                        format!("- {}/", e.name)
+                    } else {
+                        format!("- {}", e.name)
+                    }
+                })
+                .collect();
+            if total > MAX {
+                lines.push(format!("- ... and {} more entries", total - MAX));
+            }
+            lines.join("\n")
+        }
+        Err(_) => {
+            "(could not read working directory — proceed by calling list_files or find_files)"
+                .to_string()
+        }
+    }
+}
+
 async fn apply_confirmation_policy(
     mut result: ToolCallResult,
     base_path: &Path,
@@ -677,22 +795,15 @@ async fn run_agentic_loop(
         for tc in &tool_calls {
             let r = match dispatch_tool_call(&tc.function, base_path).await {
                 Ok(r) => r,
-                Err(AppError::ToolValidation(msg)) => ToolCallResult {
-                    result: Some(format!(
-                        "Error: {msg}. Use a relative path (e.g. 'src/file.rs') instead of an absolute path."
-                    )),
-                    requires_confirmation: false,
-                    description: format!("Validation failed: {msg}"),
-                    tool_name: tc.function.name.clone(),
-                    args: tc.function.arguments.clone(),
-                },
                 Err(e) => {
-                    return (
-                        LlmOutcome::Error {
-                            message: e.to_string(),
-                        },
-                        conversation,
-                    );
+                    let msg = e.to_string();
+                    ToolCallResult {
+                        result: Some(format_tool_error(&msg)),
+                        requires_confirmation: false,
+                        description: format!("Tool error: {msg}"),
+                        tool_name: tc.function.name.clone(),
+                        args: tc.function.arguments.clone(),
+                    }
                 }
             };
             let r = apply_confirmation_policy(r, base_path, config.skip_confirmations).await;
@@ -900,22 +1011,15 @@ async fn run_agentic_loop_streaming(
         for tc in &tool_calls {
             let r = match dispatch_tool_call(&tc.function, base_path).await {
                 Ok(r) => r,
-                Err(AppError::ToolValidation(msg)) => ToolCallResult {
-                    result: Some(format!(
-                        "Error: {msg}. Use a relative path (e.g. 'src/file.rs') instead of an absolute path."
-                    )),
-                    requires_confirmation: false,
-                    description: format!("Validation failed: {msg}"),
-                    tool_name: tc.function.name.clone(),
-                    args: tc.function.arguments.clone(),
-                },
                 Err(e) => {
-                    return (
-                        LlmOutcome::Error {
-                            message: e.to_string(),
-                        },
-                        conversation,
-                    );
+                    let msg = e.to_string();
+                    ToolCallResult {
+                        result: Some(format_tool_error(&msg)),
+                        requires_confirmation: false,
+                        description: format!("Tool error: {msg}"),
+                        tool_name: tc.function.name.clone(),
+                        args: tc.function.arguments.clone(),
+                    }
                 }
             };
             let r = apply_confirmation_policy(r, base_path, config.skip_confirmations).await;
@@ -995,7 +1099,9 @@ pub async fn send_message(
 
     let base_path = working_dir.as_ref().unwrap().clone();
     let user_msg = Message::user(&user_message);
-    let mut working: Vec<Message> = vec![Message::system(system_prompt(&working_dir))];
+    let dir_listing = working_dir_summary(base_path.as_path()).await;
+    let mut working: Vec<Message> =
+        vec![Message::system(system_prompt(&working_dir, &dir_listing))];
     working.extend(conversation.iter().cloned());
     working.push(user_msg.clone());
 
@@ -1057,7 +1163,9 @@ pub async fn confirm_tool(
         pending.tool_call_id,
     ));
 
-    let mut working: Vec<Message> = vec![Message::system(system_prompt(&working_dir))];
+    let dir_listing = working_dir_summary(base_path.as_path()).await;
+    let mut working: Vec<Message> =
+        vec![Message::system(system_prompt(&working_dir, &dir_listing))];
     working.extend(conversation.iter().cloned());
 
     run_agentic_loop(
@@ -1092,7 +1200,9 @@ pub async fn send_message_streaming(
 
     let base_path = working_dir.as_ref().unwrap().clone();
     let user_msg = Message::user(&user_message);
-    let mut working: Vec<Message> = vec![Message::system(system_prompt(&working_dir))];
+    let dir_listing = working_dir_summary(base_path.as_path()).await;
+    let mut working: Vec<Message> =
+        vec![Message::system(system_prompt(&working_dir, &dir_listing))];
     working.extend(conversation.iter().cloned());
     working.push(user_msg.clone());
 
@@ -1162,7 +1272,9 @@ pub async fn confirm_tool_streaming(
         pending.tool_call_id,
     ));
 
-    let mut working: Vec<Message> = vec![Message::system(system_prompt(&working_dir))];
+    let dir_listing = working_dir_summary(base_path.as_path()).await;
+    let mut working: Vec<Message> =
+        vec![Message::system(system_prompt(&working_dir, &dir_listing))];
     working.extend(conversation.iter().cloned());
 
     run_agentic_loop_streaming(
@@ -1181,36 +1293,84 @@ pub async fn confirm_tool_streaming(
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-fn system_prompt(working_dir: &Option<PathBuf>) -> String {
+fn system_prompt(working_dir: &Option<PathBuf>, dir_listing: &str) -> String {
     let dir = working_dir
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "(none selected)".into());
 
     format!(
-        "You are a file operations assistant. Help users manage files and directories using the available tools.\n\
-        Always use tools for actual operations — never fabricate file contents or listings.\n\
-        After performing an operation, briefly confirm what you did.\n\
+        "You are Cowork, an AI co-worker that helps the user with tasks on their computer. You operate inside a single working directory and have tools to read, search, find, create, edit, rename, copy, and delete files and directories.\n\
         \n\
         Working directory: {dir}\n\
         \n\
-        IMPORTANT PATH RULES:\n\
-        - Prefer relative paths (e.g. 'src/main.rs', 'README.md') — they are resolved against the working directory automatically.\n\
-        - If you use absolute paths, they MUST start with exactly: {dir}\n\
-        - Never construct absolute paths from memory — use relative paths to avoid errors.\n\
-        - If a tool returns a path error, retry using a relative path instead.\n\
+        # WORKING DIRECTORY CONTENTS (top level, refreshed each turn)\n\
+        {dir_listing}\n\
         \n\
-        EDITING FILES:\n\
-        - For small targeted changes, prefer `patch_file` (search & replace a unique string) over `edit_file` (full overwrite).\n\
-        - `patch_file` fails if the search text appears 0 or more than once — fall back to `edit_file` in that case.\n\
+        Use this listing as ground truth for which files and folders exist at the root. For deeper structure, call `find_files` (recursive: true) or `list_files` on a subdirectory. Do not invent paths that aren't visible here or returned by a tool.\n\
         \n\
-        FINDING FILES:\n\
-        - To list or find files by name or extension (e.g. 'list all .md files', 'find all .rs files'), use `find_files` with a `filename_regex` such as '\\.md$'.\n\
-        - Do NOT use `list_files` recursively or `search_in_files` for this — `list_files` is single-directory only and `search_in_files` greps file contents, not filenames.\n\
+        # CORE RULES (read carefully — these override everything else)\n\
         \n\
-        MULTI-STEP OPERATIONS:\n\
-        - For tasks that affect multiple known paths, prefer bulk tools (`delete_many`, `rename_many`) over repeated single-file calls.\n\
-        - For filename-pattern tasks (e.g. 'delete all .md files' or 'rename .jpeg to .jpg'), prefer `delete_matching` or `rename_matching` so the user sees one confirmation.\n\
-        - Use one-file-at-a-time operations only when the user explicitly asks for stepwise execution."
+        1. ONLY DO WHAT THE USER ASKED.\n\
+        - Never delete, rename, edit, overwrite, or move any file or directory the user did not explicitly tell you to change.\n\
+        - 'Cleaning up', 'tidying', 'organizing', or 'fixing' anything is NOT allowed unless the user used those words for those exact files.\n\
+        - If you think a destructive action would be helpful but the user did not request it, ASK in plain text first. Do not call the tool.\n\
+        \n\
+        2. STAY IN SCOPE — STOP WHEN THE QUESTION IS ANSWERED.\n\
+        - Call ONLY the tools strictly needed to answer the user's exact request. As soon as you have enough information to reply, STOP calling tools and respond in plain text.\n\
+        - Do NOT chain extra, unprompted tool calls. 'Exploring' the project, reading neighbouring files, summarizing unrelated files, or proactively investigating things the user did not ask about is FORBIDDEN.\n\
+        - If the user asks 'list files in src/', call `list_files` on `src` and stop. Do NOT then read any of those files. Do NOT then look at other folders.\n\
+        - If the user asks 'what does file X say', read X and stop. Do NOT then read Y or Z 'for context'.\n\
+        - Do NOT end replies with offers like 'would you like me to…?' that invent follow-up tasks. If the user wants more, they will ask.\n\
+        \n\
+        3. NEVER READ SENSITIVE FILES UNLESS EXPLICITLY ASKED BY NAME.\n\
+        - Files like `.env`, `.env.*`, anything containing 'secret', 'credential', 'token', 'key', 'password' in its name, private keys (`*.pem`, `id_rsa*`, `*.key`), `.npmrc`, `.netrc`, and similar may contain confidential data.\n\
+        - Do not call `read_file` on these unless the user explicitly named the file. Do not 'check' them to understand the project.\n\
+        - The working-directory listing below may show such files; that is for your awareness only — listing is fine, reading is not.\n\
+        \n\
+        4. READ-ONLY QUESTIONS GET READ-ONLY TOOLS.\n\
+        - If the user asks a question (count, list, summarize, explain, estimate, compare, find, show, what is, how many, which…), use ONLY read-only tools: `list_files`, `read_file`, `read_pdf`, `find_files`, `search_in_files`.\n\
+        - For these questions, you MUST NOT call `delete_file`, `delete_many`, `delete_matching`, `edit_file`, `patch_file`, `rename_file`, `rename_many`, `rename_matching`, `create_file`, `create_directory`, or `copy_file`.\n\
+        - Counting or listing files of a certain type is a read-only task. Use `find_files`, never `delete_matching`.\n\
+        \n\
+        5. NEVER FABRICATE.\n\
+        - Never invent file contents, file listings, file counts, paths, or tool results. If you don't know, call a tool. If a tool can't tell you, say so plainly.\n\
+        - Don't guess what's in a file — read it.\n\
+        \n\
+        6. ASK WHEN UNSURE.\n\
+        - If the request is ambiguous, dangerous, or you cannot tell which files it refers to, reply in plain text with a clarifying question instead of calling a tool.\n\
+        - Better to ask one question than to do the wrong thing.\n\
+        \n\
+        # PATHS\n\
+        - Always prefer relative paths (e.g. `src/main.rs`, `notes.txt`). They resolve against the working directory automatically.\n\
+        - To refer to the working directory root itself (e.g. to list everything or search the whole tree), use `.` as the path. Never leave a required `path` argument empty or omit it.\n\
+        - If you must use an absolute path, it MUST start with exactly: {dir}\n\
+        - Never use `..` to escape the working directory; it will be rejected.\n\
+        - If a tool returns a path error, retry with a relative path. Do not invent a different absolute path.\n\
+        - If a tool returns a 'Missing required argument' error, the issue is NOT the path format — re-check the tool's required arguments and supply all of them on the next call.\n\
+        \n\
+        # CHOOSING THE RIGHT TOOL\n\
+        - List the immediate contents of one directory → `list_files` (NOT recursive).\n\
+        - Find / count / enumerate files by name or extension → `find_files` with a regex like `\\.rs$` or `^README`. To enumerate EVERY file (e.g. 'filetypes in the whole repo', 'all files'), call `find_files` with `path: '.'`, `recursive: true`, and omit `filename_regex`.\n\
+        - Search for text INSIDE files (grep) → `search_in_files`.\n\
+        - Read one file → `read_file` (or `read_pdf` for `.pdf`).\n\
+        - Small targeted edit (change a unique string) → `patch_file`.\n\
+        - Full file rewrite → `edit_file` (only when `patch_file` cannot do it).\n\
+        - Several known paths to delete/rename → `delete_many` / `rename_many` (one batched confirmation).\n\
+        - User asked to delete/rename ALL files matching a pattern → `delete_matching` / `rename_matching`.\n\
+        - One file/dir to delete, rename, copy, or create → the matching single-target tool.\n\
+        \n\
+        # DESTRUCTIVE OPERATIONS\n\
+        Destructive tools: `delete_file`, `delete_many`, `delete_matching`, `edit_file`, `patch_file`, `rename_file`, `rename_many`, `rename_matching`.\n\
+        Before calling any of these, verify ALL of the following:\n\
+        - The user explicitly asked for this exact change in their most recent message (or earlier turn that is still in scope).\n\
+        - You know which file(s) they meant. If the request says 'this file' or 'that one' and you're not sure which, ask.\n\
+        - You are not using a destructive tool to answer a read-only question.\n\
+        \n\
+        # AFTER A TOOL CALL\n\
+        - Briefly confirm what was done in one or two sentences. Don't re-paste long tool output that the user can already see.\n\
+        - If a tool returned an error, report it and stop. Do not retry the same call with a guessed argument.\n\
+        \n\
+        Stay focused on what the user asked. Be concise. Be safe."
     )
 }

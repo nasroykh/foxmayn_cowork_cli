@@ -13,11 +13,11 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "list_files".into(),
-                description: "List files and directories at the given path".into(),
+                description: "Read-only. List the immediate contents (files and directories) of a single directory. NOT recursive — to find files in subdirectories or by extension, use `find_files` instead.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Path to list. Use a relative path (e.g. 'src') or the exact working directory path. Relative paths are resolved against the working directory." }
+                        "path": { "type": "string", "description": "Required. Relative path of the directory to list. Use '.' for the working directory root, or a subpath like 'src' or 'src/utils'. Never leave this empty." }
                     },
                     "required": ["path"]
                 }),
@@ -27,7 +27,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "read_file".into(),
-                description: "Read the contents of a file".into(),
+                description: "Read-only. Return the full text contents of a single file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -41,7 +41,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "read_pdf".into(),
-                description: "Extract and return the text content of a PDF file".into(),
+                description: "Read-only. Extract and return the text content of a PDF file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -55,7 +55,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "create_file".into(),
-                description: "Create a new file with content. Fails if the file already exists."
+                description: "Create a NEW file with the given content. Fails if the file already exists. Use ONLY when the user has asked to create a file."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -71,7 +71,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "edit_file".into(),
-                description: "Overwrite an existing file with new content".into(),
+                description: "Overwrite an existing file's ENTIRE content. Destructive — discards everything currently in the file. Prefer `patch_file` for small targeted changes; only use `edit_file` when the user explicitly asks to rewrite the whole file or when `patch_file` cannot be used. Use ONLY when the user has asked to modify this file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -86,7 +86,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "delete_file".into(),
-                description: "Delete a file or directory".into(),
+                description: "Delete a single file or directory. Destructive and irreversible. Use ONLY when the user has explicitly asked to delete this exact path. Never call to 'clean up', 'tidy', or remove files the user did not name.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -100,7 +100,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "delete_many".into(),
-                description: "Delete multiple explicit files or directories in one confirmed operation. Prefer this over repeated delete_file calls when the user asks to delete several known paths.".into(),
+                description: "Delete multiple explicit files or directories in one confirmed batch. Destructive and irreversible. Use ONLY when the user has explicitly listed several paths to delete; prefer this over repeated `delete_file` calls in that case.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -118,7 +118,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "rename_file".into(),
-                description: "Rename or move a file or directory".into(),
+                description: "Rename or move a single file or directory. Use ONLY when the user has explicitly asked to rename or move this path.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -133,7 +133,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "rename_many".into(),
-                description: "Rename or move multiple explicit files/directories in one confirmed operation. Fails before changing anything if a destination already exists or is duplicated.".into(),
+                description: "Rename or move multiple explicit files/directories in one confirmed batch. Fails before changing anything if a destination already exists or is duplicated. Use ONLY when the user has explicitly listed several rename/move operations.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -158,7 +158,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "delete_matching".into(),
-                description: "Delete files whose filename matches a regex under a directory in one confirmed operation. Use this for requests like deleting all .md files. Files only; directories are not deleted by this tool.".into(),
+                description: "Delete files whose filename matches a regex under a directory, in one confirmed batch. Destructive and irreversible. Files only; directories are not deleted. Use ONLY when the user has explicitly asked to delete files by pattern (e.g. the user said 'delete all .tmp files'). NEVER use to enumerate, count, or analyze files — for that use `find_files`.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -174,7 +174,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "rename_matching".into(),
-                description: "Bulk rename files whose filename matches a regex under a directory. The replacement is applied to filenames only, not full paths. Fails before changing anything if a destination exists or is duplicated.".into(),
+                description: "Bulk rename files whose filename matches a regex under a directory. The replacement is applied to filenames only, not full paths. Fails before changing anything if a destination exists or is duplicated. Use ONLY when the user has explicitly asked to rename files by pattern.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -191,7 +191,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "create_directory".into(),
-                description: "Create a new directory. Parent directories are created as needed. Fails if the path already exists.".into(),
+                description: "Create a new directory. Parent directories are created as needed. Fails if the path already exists. Use ONLY when the user has asked to create a directory.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -205,7 +205,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "copy_file".into(),
-                description: "Copy a file to a new location. Fails if the destination already exists.".into(),
+                description: "Copy a single file to a new location. Fails if the destination already exists. Use ONLY when the user has asked to copy a file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -220,15 +220,15 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "find_files".into(),
-                description: "Find files whose filename matches a regex under a directory. Use this to list files by extension (e.g. '\\.md$', '\\.rs$') or name pattern. Returns matching file paths. Skips hidden directories and build artifacts.".into(),
+                description: "Read-only. Find files under a directory, optionally filtered by a filename regex. Returns matching file paths (capped at 200). Use this whenever you need to list, count, enumerate, or categorize files. To get EVERY file (e.g. for a filetype breakdown of the whole repo), call with `path: '.'`, `recursive: true`, and OMIT `filename_regex` (it defaults to matching all files). Skips hidden directories and build artifacts.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory to search. Prefer relative paths. Relative paths are resolved against the working directory." },
-                        "filename_regex": { "type": "string", "description": "Regex applied to each filename (not the full path), e.g. '\\\\.md$' or '^README'." },
-                        "recursive": { "type": "boolean", "description": "Whether to scan subdirectories. Defaults to false." }
+                        "path": { "type": "string", "description": "Required. Relative directory to search under. Use '.' to scan the entire working directory, or a subpath like 'src'." },
+                        "filename_regex": { "type": "string", "description": "Optional. Regex applied to each filename (not the full path), e.g. '\\\\.md$' for .md files or '^README' for README files. Omit this argument entirely to match ALL files." },
+                        "recursive": { "type": "boolean", "description": "Whether to scan subdirectories. Set to true to search the whole tree (use this when the user asks about the 'repo', 'project', or 'all files'). Defaults to false." }
                     },
-                    "required": ["path", "filename_regex"]
+                    "required": ["path"]
                 }),
             },
         },
@@ -236,11 +236,11 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "search_in_files".into(),
-                description: "Search for a regex pattern inside the contents of all files under a directory. Returns matching lines with file paths and line numbers. Use this for grep-style content search, not for finding files by name — use find_files for that. Skips hidden directories and build artifacts.".into(),
+                description: "Read-only. Search for a regex pattern inside the CONTENTS of files under a directory (grep-style). Returns matching lines with file paths and line numbers. For finding files by NAME or extension, use `find_files` instead. Skips hidden directories and build artifacts.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory to search in. Prefer relative paths. Relative paths are resolved against the working directory." },
+                        "path": { "type": "string", "description": "Required. Relative directory to search under. Use '.' to scan the entire working directory, or a subpath like 'src'." },
                         "pattern": { "type": "string", "description": "Regex pattern to search for in file contents (e.g. 'fn main', 'TODO', 'error\\(')" }
                     },
                     "required": ["path", "pattern"]
@@ -251,7 +251,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "patch_file".into(),
-                description: "Replace a specific text occurrence in a file. The search text must match exactly once — fails on 0 or multiple matches. Prefer this over edit_file for small targeted changes.".into(),
+                description: "Replace a specific text occurrence inside an existing file. The `search` text must appear EXACTLY ONCE in the file — fails on 0 or multiple matches. Preferred over `edit_file` for small targeted changes. Use ONLY when the user has asked to modify this file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -636,7 +636,14 @@ pub async fn execute_tool(call: &FunctionCall, base_path: &Path) -> Result<Strin
         }
         "find_files" => {
             let path = extract_str(args, "path")?;
-            let filename_regex = extract_str(args, "filename_regex")?;
+            // filename_regex is optional — default to ".*" (match every filename) so
+            // the model can enumerate every file without inventing a "match-all" regex.
+            let filename_regex = args
+                .get("filename_regex")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(".*")
+                .to_owned();
             let recursive = extract_bool(args, "recursive");
             let resolved = validate_path_containment(&path, base_path)?
                 .to_string_lossy()

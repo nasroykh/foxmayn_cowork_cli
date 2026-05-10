@@ -1,4 +1,8 @@
-default: check
+default: help
+
+# Show this help
+help:
+    @just --list --unsorted
 
 # ── Dev ───────────────────────────────────────────────────────────────────────
 
