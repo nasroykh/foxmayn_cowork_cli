@@ -27,7 +27,7 @@ Write-Host "Installing foxmayn-cowork $Version (windows/$Arch)..."
 
 $Archive      = "foxmayn-cowork_${Version}_${Target}.zip"
 $DownloadUrl  = "https://github.com/$Repo/releases/download/$Version/$Archive"
-$ChecksumUrl  = "$DownloadUrl.sha256"
+$ChecksumUrl  = "https://github.com/$Repo/releases/download/$Version/foxmayn-cowork_${Version}_${Target}.sha256"
 
 $TmpDir = Join-Path $env:TEMP "foxmayn_cowork_install_$([System.IO.Path]::GetRandomFileName())"
 New-Item -ItemType Directory -Path $TmpDir | Out-Null

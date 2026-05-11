@@ -74,7 +74,7 @@ echo "Installing ${BINARY} ${VERSION} (${OS}/${ARCH})..."
 
 ARCHIVE="${BINARY}_${VERSION}_${TARGET}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
-CHECKSUM_URL="${URL}.sha256"
+CHECKSUM_URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY}_${VERSION}_${TARGET}.sha256"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -86,9 +86,9 @@ fetch "$CHECKSUM_URL" -o "$TMP/${ARCHIVE}.sha256"
 # --- verify checksum ---
 cd "$TMP"
 if command -v sha256sum > /dev/null 2>&1; then
-  echo "$(cat "${ARCHIVE}.sha256")  ${ARCHIVE}" | sha256sum -c -
+  sha256sum -c "${ARCHIVE}.sha256"
 elif command -v shasum > /dev/null 2>&1; then
-  echo "$(cat "${ARCHIVE}.sha256")  ${ARCHIVE}" | shasum -a 256 -c -
+  shasum -a 256 -c "${ARCHIVE}.sha256"
 else
   echo "Warning: no sha256 tool found, skipping checksum verification." >&2
 fi
