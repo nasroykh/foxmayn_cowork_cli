@@ -18,12 +18,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tui_textarea::TextArea;
 
-use crate::app::{self, App, AppEvent, ChatEntry, ChatRole, InputMode, Panel, SlashPicker,
-                  SlashPickerItem};
+use crate::app::{
+    self, App, AppEvent, ChatEntry, ChatRole, InputMode, Panel, SlashPicker, SlashPickerItem,
+};
 use crate::config::{Config, Provider, ThinkingDisplay, ToolDisplayVerbosity};
-use crate::llm::types::{OllamaThink, OllamaThinkLevel, ReasoningEffort, RequestReasoning};
 use crate::fs;
 use crate::llm;
+use crate::llm::types::{OllamaThink, OllamaThinkLevel, ReasoningEffort, RequestReasoning};
 
 pub mod commands;
 pub mod ui;
@@ -283,8 +284,7 @@ fn handle_crossterm_event(
             }
             // Tab: accept highlighted completion if popup is open, else switch panel.
             KeyCode::Tab
-                if !app.slash_completions.is_empty()
-                    && app.focused_panel == Panel::Chat =>
+                if !app.slash_completions.is_empty() && app.focused_panel == Panel::Chat =>
             {
                 if let Some(&cmd_idx) = app.slash_completions.get(app.slash_selected) {
                     let cmd = &commands::COMMANDS[cmd_idx];
@@ -305,29 +305,23 @@ fn handle_crossterm_event(
                 };
             }
             // Up/Down: navigate picker first, then completions, then chat scroll.
-            KeyCode::Up
-                if app.slash_picker.is_some() && app.focused_panel == Panel::Chat =>
-            {
+            KeyCode::Up if app.slash_picker.is_some() && app.focused_panel == Panel::Chat => {
                 if let Some(p) = app.slash_picker.as_mut() {
                     p.select_prev();
                 }
             }
-            KeyCode::Down
-                if app.slash_picker.is_some() && app.focused_panel == Panel::Chat =>
-            {
+            KeyCode::Down if app.slash_picker.is_some() && app.focused_panel == Panel::Chat => {
                 if let Some(p) = app.slash_picker.as_mut() {
                     p.select_next();
                 }
             }
             KeyCode::Up
-                if !app.slash_completions.is_empty()
-                    && app.focused_panel == Panel::Chat =>
+                if !app.slash_completions.is_empty() && app.focused_panel == Panel::Chat =>
             {
                 app.slash_select_prev();
             }
             KeyCode::Down
-                if !app.slash_completions.is_empty()
-                    && app.focused_panel == Panel::Chat =>
+                if !app.slash_completions.is_empty() && app.focused_panel == Panel::Chat =>
             {
                 app.slash_select_next();
             }
@@ -400,7 +394,11 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
         "/streaming" => {
             let next = !app.config.streaming_enabled;
             mutate_config(app, |c| c.streaming_enabled = next);
-            persist_setting(app, "streaming_enabled", if next { "true" } else { "false" });
+            persist_setting(
+                app,
+                "streaming_enabled",
+                if next { "true" } else { "false" },
+            );
             push_info(
                 app,
                 &format!("Streaming {}", if next { "on" } else { "off" }),
@@ -460,8 +458,7 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
                     push_info(app, "No sessions yet for this project.");
                 }
             } else {
-                let mut lines =
-                    vec!["Recent sessions — use /resume <id> to continue:".to_string()];
+                let mut lines = vec!["Recent sessions — use /resume <id> to continue:".to_string()];
                 for s in sessions {
                     lines.push(format!(
                         "[{}]  {}  {}",
@@ -509,7 +506,9 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
                         } else {
                             push_error(
                                 app,
-                                &format!("Session #{id} not found. Use /sessions to list available sessions."),
+                                &format!(
+                                    "Session #{id} not found. Use /sessions to list available sessions."
+                                ),
                             );
                         }
                     }
@@ -580,7 +579,11 @@ fn persist_setting(app: &mut App, key: &str, value: &str) {
 fn format_timestamp(ts: i64) -> String {
     Utc.timestamp_opt(ts, 0)
         .single()
-        .map(|utc| utc.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+        .map(|utc| {
+            utc.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| ts.to_string())
 }
 
@@ -666,14 +669,19 @@ fn apply_reasoning(app: &mut App, arg: &str) {
                             .as_ref()
                             .and_then(|r| r.summary);
                         mutate_config(app, move |c| {
-                            c.openrouter_reasoning =
-                                Some(RequestReasoning { effort: Some(effort), summary });
+                            c.openrouter_reasoning = Some(RequestReasoning {
+                                effort: Some(effort),
+                                summary,
+                            });
                         });
                         persist_setting(app, "openrouter_reasoning", arg);
                         push_info(app, &format!("OpenRouter reasoning set to: {arg}"));
                     }
                     Err(_) => {
-                        push_error(app, "Usage: /reasoning <off|minimal|none|low|medium|high|xhigh>");
+                        push_error(
+                            app,
+                            "Usage: /reasoning <off|minimal|none|low|medium|high|xhigh>",
+                        );
                     }
                 }
             }
@@ -717,9 +725,7 @@ fn openrouter_reasoning_current(config: &Config) -> &'static str {
 fn ollama_think_current(config: &Config) -> &'static str {
     match config.ollama_think {
         None | Some(OllamaThink::OnOff(false)) => "off",
-        Some(OllamaThink::OnOff(true)) | Some(OllamaThink::Level(OllamaThinkLevel::High)) => {
-            "high"
-        }
+        Some(OllamaThink::OnOff(true)) | Some(OllamaThink::Level(OllamaThinkLevel::High)) => "high",
         Some(OllamaThink::Level(OllamaThinkLevel::Medium)) => "medium",
         Some(OllamaThink::Level(OllamaThinkLevel::Low)) => "low",
     }

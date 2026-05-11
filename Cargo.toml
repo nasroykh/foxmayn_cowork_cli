@@ -26,6 +26,7 @@ regex = "1"
 pdf-extract = "0.7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 dirs = "5"
+rpassword = "7"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Optional: local LLM inference via llama.cpp

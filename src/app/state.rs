@@ -64,10 +64,7 @@ impl SlashPicker {
         if self.items.is_empty() {
             return;
         }
-        self.selected = self
-            .selected
-            .checked_sub(1)
-            .unwrap_or(self.items.len() - 1);
+        self.selected = self.selected.checked_sub(1).unwrap_or(self.items.len() - 1);
     }
 
     pub fn select_next(&mut self) {
@@ -639,8 +636,7 @@ impl App {
                 }
             }
         }
-        if let (Some(id), Some(project)) =
-            (self.current_session_id, self.storage.project.as_ref())
+        if let (Some(id), Some(project)) = (self.current_session_id, self.storage.project.as_ref())
         {
             let _ = project.save_session(id, &conv_json, &chat_json);
         }

@@ -76,6 +76,37 @@ fmt-check:
 # Run check + lint + fmt-check in one shot
 ci: fmt-check lint check
 
+# ── Install ───────────────────────────────────────────────────────────────────
+
+# Install the release binary to ~/.local/bin (or /usr/local/bin if writable)
+install:
+    #!/usr/bin/env sh
+    set -eu
+    cargo build --release
+    BINARY=target/release/foxmayn-cowork
+    if [ -w "/usr/local/bin" ]; then
+        DEST="/usr/local/bin/foxmayn-cowork"
+    else
+        mkdir -p "$HOME/.local/bin"
+        DEST="$HOME/.local/bin/foxmayn-cowork"
+    fi
+    cp "$BINARY" "$DEST"
+    chmod +x "$DEST"
+    echo "Installed to $DEST"
+
+# Uninstall the binary installed by `just install`
+uninstall:
+    #!/usr/bin/env sh
+    set -eu
+    for dir in "/usr/local/bin" "$HOME/.local/bin"; do
+        if [ -f "$dir/foxmayn-cowork" ]; then
+            rm "$dir/foxmayn-cowork"
+            echo "Removed $dir/foxmayn-cowork"
+            exit 0
+        fi
+    done
+    echo "foxmayn-cowork not found in /usr/local/bin or ~/.local/bin"
+
 # ── Misc ──────────────────────────────────────────────────────────────────────
 
 # Local smoke check for a demo-ready checkout

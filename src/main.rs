@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod fs;
 mod llm;
+mod setup;
 mod storage;
 mod tui;
 
@@ -56,13 +57,47 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         dir: PathBuf,
     },
+    /// Configure the AI provider and API keys interactively.
+    Config,
 }
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    // CWD/.env takes precedence (dev workflow with `just run`).
+    let loaded_from_cwd = dotenvy::dotenv().is_ok();
 
     let cli = Cli::parse();
+
+    // `foxmayn-cowork config`: load existing config for defaults, run wizard, exit.
+    if matches!(cli.command, Some(Commands::Config)) {
+        if !loaded_from_cwd {
+            if let Some(p) = setup::config_path() {
+                dotenvy::from_path(&p).ok();
+            }
+        }
+        let current = Config::from_env();
+        if let Err(e) = setup::run_wizard(Some(&current)) {
+            eprintln!("Config error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // First-time setup: run wizard when no config file exists and stdin is a TTY.
+    if !loaded_from_cwd && setup::needs_init() {
+        if let Err(e) = setup::run_wizard(None) {
+            eprintln!("Setup error: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // Load the config-dir .env (written by wizard or pre-existing).
+    if !loaded_from_cwd {
+        if let Some(p) = setup::config_path() {
+            dotenvy::from_path(&p).ok();
+        }
+    }
+
     let base_config = Config::from_env().with_overrides(
         cli.provider,
         cli.model,
@@ -120,12 +155,13 @@ fn preflight(config: &Config) -> Result<(), String> {
     {
         return Err("Error: OPENROUTER_API_KEY is not set.\n\n\
              Either:\n  \
-                1. Add it to .env (run `just env` to copy from .env.example,\n     \
-                   then fill in OPENROUTER_API_KEY=…)\n  \
-                2. Set PROVIDER=ollama (or pass --provider ollama) to use a local\n     \
+                1. Set it in ~/.config/foxmayn-cowork/.env:\n     \
+                   OPENROUTER_API_KEY=sk-or-…\n  \
+                2. Export it in your shell profile:\n     \
+                   export OPENROUTER_API_KEY=sk-or-…\n  \
+                3. Set PROVIDER=ollama (or pass --provider ollama) to use a local\n     \
                    Ollama instance instead\n  \
-                3. Build with --features local and set PROVIDER=local for fully\n     \
-                   offline inference (no API key required)\n\n\
+                4. Set PROVIDER=local for fully offline inference (no API key required)\n\n\
              See README.md for full setup instructions."
             .to_string());
     }

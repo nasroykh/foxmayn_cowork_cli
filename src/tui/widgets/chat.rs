@@ -283,7 +283,12 @@ fn status_line(app: &App) -> String {
     };
 
     let reasoning = match app.config.provider {
-        Provider::OpenRouter => match app.config.openrouter_reasoning.as_ref().and_then(|r| r.effort) {
+        Provider::OpenRouter => match app
+            .config
+            .openrouter_reasoning
+            .as_ref()
+            .and_then(|r| r.effort)
+        {
             None => "off",
             Some(ReasoningEffort::XHigh) => "xhigh",
             Some(ReasoningEffort::High) => "high",
@@ -294,8 +299,9 @@ fn status_line(app: &App) -> String {
         },
         Provider::Ollama => match app.config.ollama_think {
             None | Some(OllamaThink::OnOff(false)) => "off",
-            Some(OllamaThink::OnOff(true))
-            | Some(OllamaThink::Level(OllamaThinkLevel::High)) => "high",
+            Some(OllamaThink::OnOff(true)) | Some(OllamaThink::Level(OllamaThinkLevel::High)) => {
+                "high"
+            }
             Some(OllamaThink::Level(OllamaThinkLevel::Medium)) => "medium",
             Some(OllamaThink::Level(OllamaThinkLevel::Low)) => "low",
         },

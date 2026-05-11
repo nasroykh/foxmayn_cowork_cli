@@ -71,7 +71,10 @@ impl Storage {
             Err(_) => {
                 let conn = Connection::open_in_memory().expect("in-memory SQLite");
                 init_global_schema(&conn).ok();
-                Storage { global: conn, project: None }
+                Storage {
+                    global: conn,
+                    project: None,
+                }
             }
         }
     }
@@ -81,7 +84,10 @@ impl Storage {
         std::fs::create_dir_all(&base).ok();
         let conn = Connection::open(base.join("settings.db"))?;
         init_global_schema(&conn)?;
-        Ok(Storage { global: conn, project: None })
+        Ok(Storage {
+            global: conn,
+            project: None,
+        })
     }
 
     /// Load all saved settings as (key, value) pairs.
@@ -113,9 +119,7 @@ impl Storage {
     }
 
     fn try_open_project(&self, working_dir: &Path) -> rusqlite::Result<ProjectStorage> {
-        let project_dir = base_dir()
-            .join("projects")
-            .join(sanitize_path(working_dir));
+        let project_dir = base_dir().join("projects").join(sanitize_path(working_dir));
         std::fs::create_dir_all(&project_dir).ok();
         let conn = Connection::open(project_dir.join("data.db"))?;
         init_project_schema(&conn)?;
