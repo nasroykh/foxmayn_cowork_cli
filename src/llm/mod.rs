@@ -4,6 +4,9 @@ pub mod runtime;
 pub mod tools;
 pub mod types;
 
+/// Maximum number of LLM ↔ tool back-and-forth rounds before the loop errors out.
+pub const MAX_TOOL_ROUNDS: usize = 10;
+
 #[cfg(feature = "local")]
 pub mod local;
 

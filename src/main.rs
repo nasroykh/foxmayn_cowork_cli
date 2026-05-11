@@ -6,6 +6,7 @@ mod llm;
 mod tui;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
@@ -91,7 +92,7 @@ async fn main() {
         }
     };
 
-    let mut app = App::new(config, llm_runtime);
+    let mut app = App::new(Arc::new(config), llm_runtime);
 
     if let Some(dir) = cli.dir {
         app.set_working_dir(dir);
@@ -124,24 +125,16 @@ fn preflight(config: &Config) -> Result<(), String> {
             .to_string());
     }
 
-    if matches!(config.provider, Provider::Local) {
-        #[cfg(not(feature = "local"))]
-        return Err(
-            "Error: PROVIDER=local requires building with the `local` feature.\n\n\
-             Rebuild with:\n  cargo build --release --features local\n\n\
-             Or run directly:\n  cargo run --features local -- --provider local --dir <path>"
-                .to_string(),
-        );
-    }
+    // Provider::Local validation moved to LlmRuntime::build so there is a single
+    // check point and no cfg gates needed here.
 
     Ok(())
 }
 
 async fn probe(config: Config, message: String, dir: PathBuf) {
-    use llm::tools::{dispatch_tool_call, tool_definitions};
+    use llm::tools::{dispatch_tool_call, execute_tool, tool_definitions};
     use llm::types::{ChatRequest, Message};
 
-    let client = reqwest::Client::new();
     let base_path = dir.canonicalize().unwrap_or(dir.clone());
 
     println!("=== PROBE ===");
@@ -152,153 +145,120 @@ async fn probe(config: Config, message: String, dir: PathBuf) {
     println!("message  : {message}");
     println!();
 
+    // Probe always targets Ollama regardless of config.provider (intentional — documented).
+    let ollama_config = Config {
+        provider: config::Provider::Ollama,
+        ..config.clone()
+    };
+
+    let runtime = match LlmRuntime::build(&ollama_config).await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("ERROR: failed to build LLM runtime: {e}");
+            return;
+        }
+    };
+
     let mut messages: Vec<Message> = vec![Message::user(&message)];
 
-    for round in 1..=10 {
+    for round in 1..=llm::MAX_TOOL_ROUNDS {
         let request = ChatRequest {
-            model: config.model.clone(),
+            model: ollama_config.model.clone(),
             messages: messages.clone(),
             tools: tool_definitions(),
             stream: false,
-            reasoning: config.openrouter_reasoning.clone(),
-            think: config.ollama_think,
+            reasoning: ollama_config.openrouter_reasoning.clone(),
+            think: ollama_config.ollama_think,
         };
 
         println!("--- REQUEST (round {round}) ---");
         println!("{}", serde_json::to_string_pretty(&request).unwrap());
         println!();
 
-        // Send raw HTTP so we can print the body before parsing
-        let url = format!("{}/api/chat", config.ollama_base_url);
-        let raw = client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .expect("HTTP request failed");
-
-        let status = raw.status();
-        let body = raw.text().await.unwrap_or_default();
-
-        println!("--- RESPONSE (round {round}) status={status} ---");
-        // Pretty-print if valid JSON, raw otherwise
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
-            Err(_) => println!("{body}"),
-        }
-        println!();
-
-        if !status.is_success() {
-            println!("ERROR: non-2xx status, stopping.");
-            break;
-        }
-
-        // Parse into our types
-        #[derive(serde::Deserialize)]
-        struct OllamaResp {
-            message: OllamaMsg,
-        }
-        #[derive(serde::Deserialize)]
-        struct OllamaMsg {
-            role: String,
-            #[serde(default)]
-            content: String,
-            tool_calls: Option<Vec<serde_json::Value>>,
-        }
-
-        let parsed: OllamaResp = match serde_json::from_str(&body) {
-            Ok(p) => p,
+        let assistant_msg = match llm::chat(&runtime, &request, &ollama_config).await {
+            Ok(msg) => msg,
             Err(e) => {
-                println!("PARSE ERROR: {e}");
+                println!("ERROR: {e}");
                 break;
             }
         };
 
-        let tool_calls = parsed.message.tool_calls.unwrap_or_default();
-        println!("content      : {:?}", parsed.message.content);
-        println!("tool_calls # : {}", tool_calls.len());
+        // Pretty-print the returned message as JSON for inspection
+        println!("--- RESPONSE (round {round}) ---");
+        match serde_json::to_string_pretty(&assistant_msg) {
+            Ok(s) => println!("{s}"),
+            Err(_) => println!("{assistant_msg:?}"),
+        }
         println!();
 
-        // Push assistant message
-        let assistant_msg = Message {
-            role: parsed.message.role,
-            content: parsed.message.content.clone(),
-            tool_calls: if tool_calls.is_empty() {
-                None
-            } else {
-                Some(
-                    tool_calls
-                        .iter()
-                        .map(|tc| {
-                            let name = tc
-                                .get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let arguments = tc
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Object(Default::default()));
-                            llm::types::ToolCall {
-                                id: None,
-                                r#type: "function".to_string(),
-                                function: llm::types::FunctionCall { name, arguments },
-                            }
-                        })
-                        .collect(),
-                )
-            },
-            name: None,
-            tool_call_id: None,
-        };
+        let has_tool_calls = assistant_msg
+            .tool_calls
+            .as_ref()
+            .is_some_and(|c| !c.is_empty());
+
+        println!("content      : {:?}", assistant_msg.content);
+        println!(
+            "tool_calls # : {}",
+            assistant_msg
+                .tool_calls
+                .as_ref()
+                .map_or(0, Vec::len)
+        );
+        println!();
+
         messages.push(assistant_msg.clone());
 
-        if tool_calls.is_empty() {
+        if !has_tool_calls {
             println!("=== DONE (no tool calls) ===");
-            if parsed.message.content.trim().is_empty() {
+            if assistant_msg.content.trim().is_empty() {
                 println!("WARNING: empty content + no tool calls -> this is the bug");
             }
             break;
         }
 
         // Execute tools
-        for tc_val in &tool_calls {
-            let name = tc_val
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("?");
-            let arguments = tc_val
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .cloned()
-                .unwrap_or_default();
+        for tc in assistant_msg.tool_calls.unwrap_or_default() {
+            println!("--- TOOL CALL: {} ---", tc.function.name);
+            println!("args: {}", tc.function.arguments);
 
-            println!("--- TOOL CALL: {name} ---");
-            println!("args: {arguments}");
-
-            let fc = llm::types::FunctionCall {
-                name: name.to_string(),
-                arguments,
-            };
-            match dispatch_tool_call(&fc, &base_path).await {
+            match dispatch_tool_call(&tc.function, &base_path).await {
+                Ok(r) if r.requires_confirmation => {
+                    println!("result: <needs confirmation — executing unconditionally in probe>");
+                    match execute_tool(&tc.function, &base_path).await {
+                        Ok(output) => {
+                            println!("executed: {output}");
+                            messages.push(Message::tool_result(
+                                &tc.function.name,
+                                &output,
+                                tc.id.clone(),
+                            ));
+                        }
+                        Err(e) => {
+                            println!("tool error: {e}");
+                            messages.push(Message::tool_result(
+                                &tc.function.name,
+                                format!("Error: {e}"),
+                                tc.id.clone(),
+                            ));
+                        }
+                    }
+                }
                 Ok(r) => {
-                    println!(
-                        "result: {}",
-                        r.result.as_deref().unwrap_or("<needs confirmation>")
-                    );
-                    let tool_result = Message::tool_result(
-                        &fc.name,
-                        r.result.as_deref().unwrap_or("requires_confirmation: true"),
-                        None,
-                    );
-                    messages.push(tool_result);
+                    let result_str = r.result.as_deref().unwrap_or("");
+                    println!("result: {result_str}");
+                    messages.push(Message::tool_result(
+                        &tc.function.name,
+                        result_str,
+                        tc.id.clone(),
+                    ));
                 }
                 Err(e) => {
                     println!("tool error: {e}");
-                    messages.push(Message::tool_result(&fc.name, format!("Error: {e}"), None));
+                    messages.push(Message::tool_result(
+                        &tc.function.name,
+                        format!("Error: {e}"),
+                        tc.id.clone(),
+                    ));
                 }
             }
             println!();
