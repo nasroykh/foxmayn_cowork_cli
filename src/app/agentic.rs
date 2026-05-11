@@ -203,12 +203,117 @@ pub(super) async fn run_agentic_loop(
         };
 
         // ── Fetch the assistant message (streaming or non-streaming) ──────────
-        let (assistant_msg, assembled_tool_calls, content) =
-            if let Some((request_id, tx)) = stream_ctx.as_ref() {
-                // Streaming path
-                let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<StreamChunk>();
+        let (assistant_msg, assembled_tool_calls, content) = if let Some((request_id, tx)) =
+            stream_ctx.as_ref()
+        {
+            // Streaming path
+            let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<StreamChunk>();
 
-                if let Err(e) = llm::chat_stream(runtime, &request, config, chunk_tx).await {
+            if let Err(e) = llm::chat_stream(runtime, &request, config, chunk_tx).await {
+                return (
+                    LlmOutcome::Error {
+                        message: e.to_string(),
+                    },
+                    conversation,
+                );
+            }
+
+            let mut content = String::new();
+            let mut partial_tool_calls: Vec<PartialToolCall> = Vec::new();
+
+            loop {
+                match chunk_rx.recv().await {
+                    None => break,
+                    Some(StreamChunk::ContentDelta(text)) => {
+                        content.push_str(&text);
+                        let _ = tx.send(AppEvent::StreamChunk {
+                            request_id: *request_id,
+                            chunk: StreamChunk::ContentDelta(text),
+                        });
+                    }
+                    Some(StreamChunk::ThinkingDelta(text)) => {
+                        let _ = tx.send(AppEvent::StreamChunk {
+                            request_id: *request_id,
+                            chunk: StreamChunk::ThinkingDelta(text),
+                        });
+                    }
+                    Some(StreamChunk::ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        arguments_fragment,
+                    }) => {
+                        while partial_tool_calls.len() <= index {
+                            partial_tool_calls.push(PartialToolCall {
+                                id: None,
+                                name: None,
+                                arguments: String::new(),
+                            });
+                        }
+                        let ptc = &mut partial_tool_calls[index];
+                        if id.is_some() {
+                            ptc.id = id;
+                        }
+                        if name.is_some() {
+                            ptc.name = name;
+                        }
+                        ptc.arguments.push_str(&arguments_fragment);
+                    }
+                    Some(StreamChunk::Done) => break,
+                    Some(StreamChunk::Error(e)) => {
+                        return (LlmOutcome::Error { message: e }, conversation);
+                    }
+                }
+            }
+
+            let has_tool_calls = !partial_tool_calls.is_empty();
+            let assembled: Option<Vec<ToolCall>> = if has_tool_calls {
+                let mut out: Vec<ToolCall> = Vec::with_capacity(partial_tool_calls.len());
+                let mut parse_err: Option<(String, String, String)> = None;
+                for ptc in &partial_tool_calls {
+                    let name = ptc.name.clone().unwrap_or_default();
+                    match serde_json::from_str::<serde_json::Value>(&ptc.arguments) {
+                        Ok(arguments) => out.push(ToolCall {
+                            id: ptc.id.clone(),
+                            r#type: "function".to_string(),
+                            function: FunctionCall { name, arguments },
+                        }),
+                        Err(e) => {
+                            parse_err = Some((name, ptc.arguments.clone(), e.to_string()));
+                            break;
+                        }
+                    }
+                }
+                if let Some((name, raw, err)) = parse_err {
+                    return (
+                        LlmOutcome::Error {
+                            message: format!(
+                                "Failed to parse streamed tool-call arguments for '{name}': {err}. \
+                                     Raw fragment: {raw}. This usually means the provider streamed \
+                                     the same tool call twice or split it inconsistently."
+                            ),
+                        },
+                        conversation,
+                    );
+                }
+                Some(out)
+            } else {
+                None
+            };
+
+            let msg = Message {
+                role: "assistant".into(),
+                content: content.clone(),
+                tool_calls: assembled.clone(),
+                name: None,
+                tool_call_id: None,
+            };
+            (msg, assembled, content)
+        } else {
+            // Non-streaming path
+            let msg = match llm::chat(runtime, &request, config).await {
+                Ok(r) => r,
+                Err(e) => {
                     return (
                         LlmOutcome::Error {
                             message: e.to_string(),
@@ -216,103 +321,11 @@ pub(super) async fn run_agentic_loop(
                         conversation,
                     );
                 }
-
-                let mut content = String::new();
-                let mut partial_tool_calls: Vec<PartialToolCall> = Vec::new();
-
-                loop {
-                    match chunk_rx.recv().await {
-                        None => break,
-                        Some(StreamChunk::ContentDelta(text)) => {
-                            content.push_str(&text);
-                            let _ = tx.send(AppEvent::StreamChunk {
-                                request_id: *request_id,
-                                chunk: StreamChunk::ContentDelta(text),
-                            });
-                        }
-                        Some(StreamChunk::ThinkingDelta(text)) => {
-                            let _ = tx.send(AppEvent::StreamChunk {
-                                request_id: *request_id,
-                                chunk: StreamChunk::ThinkingDelta(text),
-                            });
-                        }
-                        Some(StreamChunk::ToolCallDelta {
-                            index,
-                            id,
-                            name,
-                            arguments_fragment,
-                        }) => {
-                            while partial_tool_calls.len() <= index {
-                                partial_tool_calls.push(PartialToolCall {
-                                    id: None,
-                                    name: None,
-                                    arguments: String::new(),
-                                });
-                            }
-                            let ptc = &mut partial_tool_calls[index];
-                            if id.is_some() {
-                                ptc.id = id;
-                            }
-                            if name.is_some() {
-                                ptc.name = name;
-                            }
-                            ptc.arguments.push_str(&arguments_fragment);
-                        }
-                        Some(StreamChunk::Done) => break,
-                        Some(StreamChunk::Error(e)) => {
-                            return (LlmOutcome::Error { message: e }, conversation);
-                        }
-                    }
-                }
-
-                let has_tool_calls = !partial_tool_calls.is_empty();
-                let assembled: Option<Vec<ToolCall>> = if has_tool_calls {
-                    Some(
-                        partial_tool_calls
-                            .iter()
-                            .map(|ptc| {
-                                let arguments: serde_json::Value =
-                                    serde_json::from_str(&ptc.arguments).unwrap_or_default();
-                                ToolCall {
-                                    id: ptc.id.clone(),
-                                    r#type: "function".to_string(),
-                                    function: FunctionCall {
-                                        name: ptc.name.clone().unwrap_or_default(),
-                                        arguments,
-                                    },
-                                }
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
-
-                let msg = Message {
-                    role: "assistant".into(),
-                    content: content.clone(),
-                    tool_calls: assembled.clone(),
-                    name: None,
-                    tool_call_id: None,
-                };
-                (msg, assembled, content)
-            } else {
-                // Non-streaming path
-                let msg = match llm::chat(runtime, &request, config).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return (
-                            LlmOutcome::Error {
-                                message: e.to_string(),
-                            },
-                            conversation,
-                        );
-                    }
-                };
-                let content = msg.content.clone();
-                let tc = msg.tool_calls.clone();
-                (msg, tc, content)
             };
+            let content = msg.content.clone();
+            let tc = msg.tool_calls.clone();
+            (msg, tc, content)
+        };
 
         // ── Handle response ───────────────────────────────────────────────────
         let has_tool_calls = assembled_tool_calls.as_ref().is_some_and(|c| !c.is_empty());

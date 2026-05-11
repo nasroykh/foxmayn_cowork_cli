@@ -56,6 +56,9 @@ enum Commands {
         /// Working directory for tool execution
         #[arg(short, long, default_value = ".")]
         dir: PathBuf,
+        /// Use the streaming chat path (chat_stream + assembler) instead of one-shot chat.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        stream: bool,
     },
     /// Configure the AI provider and API keys interactively.
     Config,
@@ -70,10 +73,8 @@ async fn main() {
 
     // `foxmayn-cowork config`: load existing config for defaults, run wizard, exit.
     if matches!(cli.command, Some(Commands::Config)) {
-        if !loaded_from_cwd {
-            if let Some(p) = setup::config_path() {
-                dotenvy::from_path(&p).ok();
-            }
+        if !loaded_from_cwd && let Some(p) = setup::config_path() {
+            dotenvy::from_path(&p).ok();
         }
         let current = Config::from_env();
         if let Err(e) = setup::run_wizard(Some(&current)) {
@@ -84,18 +85,17 @@ async fn main() {
     }
 
     // First-time setup: run wizard when no config file exists and stdin is a TTY.
-    if !loaded_from_cwd && setup::needs_init() {
-        if let Err(e) = setup::run_wizard(None) {
-            eprintln!("Setup error: {e}");
-            std::process::exit(1);
-        }
+    if !loaded_from_cwd
+        && setup::needs_init()
+        && let Err(e) = setup::run_wizard(None)
+    {
+        eprintln!("Setup error: {e}");
+        std::process::exit(1);
     }
 
     // Load the config-dir .env (written by wizard or pre-existing).
-    if !loaded_from_cwd {
-        if let Some(p) = setup::config_path() {
-            dotenvy::from_path(&p).ok();
-        }
+    if !loaded_from_cwd && let Some(p) = setup::config_path() {
+        dotenvy::from_path(&p).ok();
     }
 
     let base_config = Config::from_env().with_overrides(
@@ -105,8 +105,13 @@ async fn main() {
         cli.skip_confirmations,
     );
 
-    if let Some(Commands::Probe { message, dir }) = cli.command {
-        probe(base_config, message, dir).await;
+    if let Some(Commands::Probe {
+        message,
+        dir,
+        stream,
+    }) = cli.command
+    {
+        probe(base_config, message, dir, stream).await;
         return;
     }
 
@@ -131,6 +136,40 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    if matches!(config.provider, Provider::Ollama) {
+        match llm::ollama::model_supports_tools(
+            &llm_runtime.http_client,
+            &config.ollama_base_url,
+            &config.model,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "Error: Ollama model '{}' does not declare tool-calling support.\n\n\
+                     This app drives a tool-calling agent loop; running against a model whose\n\
+                     chat template does not render `role: tool` messages will silently break\n\
+                     after the first tool call (the model loses sight of the tool result and\n\
+                     the original user request).\n\n\
+                     Pick a model whose `capabilities` includes `tools` — e.g. `qwen2.5:7b`,\n\
+                     `llama3.1:8b`, `mistral-nemo`. Run `ollama show <model>` to verify, or\n\
+                     re-run `foxmayn-cowork config` to change the model.",
+                    config.model
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not verify tool-calling support for Ollama model '{}': {e}\n\
+                     Proceeding anyway — if the model misbehaves after tool calls, switch to a\n\
+                     tool-capable model (e.g. qwen2.5:7b, llama3.1:8b).",
+                    config.model
+                );
+            }
+        }
+    }
 
     let mut app = App::new(Arc::new(config), llm_runtime, storage);
 
@@ -172,7 +211,7 @@ fn preflight(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-async fn probe(config: Config, message: String, dir: PathBuf) {
+async fn probe(config: Config, message: String, dir: PathBuf, stream: bool) {
     use llm::tools::{dispatch_tool_call, execute_tool, tool_definitions};
     use llm::types::{ChatRequest, Message};
 
@@ -207,7 +246,7 @@ async fn probe(config: Config, message: String, dir: PathBuf) {
             model: ollama_config.model.clone(),
             messages: messages.clone(),
             tools: tool_definitions(),
-            stream: false,
+            stream,
             reasoning: ollama_config.openrouter_reasoning.clone(),
             think: ollama_config.ollama_think,
         };
@@ -216,11 +255,21 @@ async fn probe(config: Config, message: String, dir: PathBuf) {
         println!("{}", serde_json::to_string_pretty(&request).unwrap());
         println!();
 
-        let assistant_msg = match llm::chat(&runtime, &request, &ollama_config).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                println!("ERROR: {e}");
-                break;
+        let assistant_msg = if stream {
+            match probe_stream_one(&runtime, &request, &ollama_config).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    println!("ERROR: {e}");
+                    break;
+                }
+            }
+        } else {
+            match llm::chat(&runtime, &request, &ollama_config).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    println!("ERROR: {e}");
+                    break;
+                }
             }
         };
 
@@ -302,4 +351,104 @@ async fn probe(config: Config, message: String, dir: PathBuf) {
             println!();
         }
     }
+}
+
+/// Streaming probe path: drive `llm::chat_stream`, print chunks live, and assemble the same
+/// final `Message` the agentic loop would build. Mirrors `app::agentic::run_agentic_loop`'s
+/// streaming branch so the probe exercises the exact codepath that runs in the TUI.
+async fn probe_stream_one(
+    runtime: &LlmRuntime,
+    request: &llm::types::ChatRequest,
+    config: &Config,
+) -> Result<llm::types::Message, error::AppError> {
+    use llm::types::{FunctionCall, Message, StreamChunk, ToolCall};
+    use tokio::sync::mpsc;
+
+    struct Partial {
+        id: Option<String>,
+        name: Option<String>,
+        args: String,
+    }
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamChunk>();
+    llm::chat_stream(runtime, request, config, tx).await?;
+
+    let mut content = String::new();
+    let mut partials: Vec<Partial> = Vec::new();
+
+    println!("--- STREAM CHUNKS ---");
+    while let Some(chunk) = rx.recv().await {
+        match chunk {
+            StreamChunk::ContentDelta(t) => {
+                print!("{t}");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                content.push_str(&t);
+            }
+            StreamChunk::ThinkingDelta(t) => {
+                eprintln!("[thinking] {t}");
+            }
+            StreamChunk::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_fragment,
+            } => {
+                while partials.len() <= index {
+                    partials.push(Partial {
+                        id: None,
+                        name: None,
+                        args: String::new(),
+                    });
+                }
+                let p = &mut partials[index];
+                if id.is_some() {
+                    p.id = id;
+                }
+                if name.is_some() {
+                    p.name = name;
+                }
+                p.args.push_str(&arguments_fragment);
+                println!(
+                    "[tool-delta] idx={index} name={:?} args_so_far={:?}",
+                    p.name, p.args
+                );
+            }
+            StreamChunk::Done => break,
+            StreamChunk::Error(e) => {
+                return Err(error::AppError::LlmError(format!("stream error: {e}")));
+            }
+        }
+    }
+    println!();
+    println!("--- /STREAM CHUNKS ---");
+
+    let tool_calls = if partials.is_empty() {
+        None
+    } else {
+        let mut out = Vec::with_capacity(partials.len());
+        for p in partials {
+            let name = p.name.clone().unwrap_or_default();
+            let arguments: serde_json::Value = serde_json::from_str(&p.args).map_err(|e| {
+                error::AppError::LlmError(format!(
+                    "tool arguments parse failed for '{name}': {e} (raw={:?})",
+                    p.args
+                ))
+            })?;
+            out.push(ToolCall {
+                id: p.id,
+                r#type: "function".into(),
+                function: FunctionCall { name, arguments },
+            });
+        }
+        Some(out)
+    };
+
+    Ok(Message {
+        role: "assistant".into(),
+        content,
+        tool_calls,
+        name: None,
+        tool_call_id: None,
+    })
 }

@@ -26,7 +26,11 @@ Run a single test module: `cargo test llm::types` (tests live in `src/llm/types.
 
 ### Probe subcommand
 
-`foxmayn-cowork probe [message] [--dir <path>]` — fires one message at Ollama without the TUI and dumps the raw HTTP request, response body, and every tool round-trip to stdout. Ollama only (hardcoded to `ollama_base_url`). Useful for isolating streaming or tool-schema bugs.
+`foxmayn-cowork probe [message] [--dir <path>] [--stream]` — fires one message at Ollama without the TUI and dumps the raw HTTP request, response body, and every tool round-trip to stdout. Ollama only (hardcoded to `ollama_base_url`). Useful for isolating streaming or tool-schema bugs. Pass `--stream` to drive `llm::chat_stream` + the agentic-loop chunk assembler — the exact code path that runs in the TUI — and print each `StreamChunk::ToolCallDelta` live, which is what you want when diagnosing streaming tool-call corruption.
+
+### Config subcommand
+
+`foxmayn-cowork config` — interactive wizard that writes `~/.config/foxmayn-cowork/.env`. Run on first launch if no config exists and stdin is a TTY (`setup::needs_init`). Re-runnable any time to change provider, model, or API key.
 
 ## Setup
 
@@ -69,6 +73,8 @@ All async work is fire-and-forget (`tokio::spawn`). Results come back through an
 - `src/llm/runtime.rs` — `LlmRuntime` (cheaply-cloneable handle holding `reqwest::Client` and, when `--features local`, an `Arc<LocalRuntime>`); built once at startup in `main.rs` and cloned into every spawned task.
 - `src/llm/local.rs` — `--features local` only; `LocalRuntime` (llama.cpp backend + model loaded once), `chat` / `chat_stream` (run inference in `spawn_blocking`, bridge result to `StreamChunk` channel), `build_prompt` (ChatML format), `parse_output` (JSON tool-call detection).
 - `src/config.rs` — `Config::from_env()` + `with_overrides()`, reasoning/think env var parsing, display-verbosity env vars (`TOOL_DISPLAY_VERBOSITY`, `THINKING_DISPLAY`), local model env vars (`LOCAL_MODEL_REPO`, `LOCAL_MODEL_FILE`, `LOCAL_MODEL_PATH`, `LOCAL_CONTEXT_TOKENS`, `LOCAL_GPU_LAYERS`, `LOCAL_THREADS`, `LOCAL_MAX_OUTPUT_TOKENS`, `LOCAL_TEMPERATURE`).
+- `src/setup.rs` — `config_path` (`~/.config/foxmayn-cowork/.env`), `needs_init`, `run_wizard` (interactive provider/model/API-key prompts; password input via `rpassword`).
+- `src/storage.rs` — SQLite-backed persistent storage. `Storage` opens a global DB plus a per-project DB keyed by `sanitize_path(working_dir)`. `apply_saved_settings` layers saved settings over the env-derived `Config` at startup. `SessionSummary` powers `/sessions` / `/resume`.
 - `src/fs.rs` — async file-system operations called by tools; includes `read_pdf` (extracts text via `pdf-extract`, 50 MB cap, runs in `spawn_blocking`).
 
 ### Tool confirmation flow
@@ -82,7 +88,7 @@ Read-only tools (`list_files`, `read_file`, `read_pdf`, `find_files`, `search_in
 Three providers are supported, all dispatched through `llm::mod.rs` via `&LlmRuntime`:
 
 - `openrouter` — HTTP; sends `reasoning` (effort + summary verbosity). Default model `google/gemini-2.5-flash-lite` with `reasoning.effort: "minimal"`. Outgoing requests go through `to_openrouter_body` which converts each `tool_calls[].function.arguments` from a JSON object to a JSON string (OpenAI/Google AI Studio reject the object form). Streamed `delta.reasoning` is forwarded as `StreamChunk::ThinkingDelta`.
-- `ollama` — HTTP; sends `think` (bool or `high`/`medium`/`low`). Default endpoint `http://localhost:11434`. Keeps `arguments` as a JSON object on the wire. Streamed `message.thinking` is forwarded as `StreamChunk::ThinkingDelta`.
+- `ollama` — HTTP; sends `think` (bool or `high`/`medium`/`low`). Default endpoint `http://localhost:11434`. Keeps `arguments` as a JSON object on the wire. Streamed `message.thinking` is forwarded as `StreamChunk::ThinkingDelta`. At startup, `main.rs` calls `ollama::model_supports_tools` (POST `/api/show`, check `capabilities` includes `"tools"`) and refuses to launch with a clear error when the model is not tool-capable; network errors degrade to a warning. The streaming NDJSON parser (`process_ndjson_stream`) buffers the most recent `tool_calls` array across lines and emits it once at `done` — this is correct whether the model emits tool calls on `done:false` only (qwen3 thinking), `done:true` only, or both, and it preserves Ollama-provided tool-call ids when present.
 - `local` — embedded llama.cpp via the `llama-cpp-2` crate; only available when built with `--features local`. Tool schemas are injected into the system prompt in ChatML format; tool calls are detected by scanning the output for `{"name": …, "arguments": …}`. Inference runs in `tokio::task::spawn_blocking`. The model is loaded once at startup (`LocalRuntime`) and shared across requests via `Arc`. Each request creates a fresh `LlamaContext`. Requires `cmake` at build time.
 
 ### Tool / thinking display
@@ -92,16 +98,34 @@ Two env vars control how live activity is rendered in the chat panel:
 - `TOOL_DISPLAY_VERBOSITY` (`default` | `minimal` | `full`) — handled by `format_tool_summary` in `src/app/agentic.rs`, used by both streaming (`AppEvent::IntermediateTool`) and non-streaming (`LlmOutcome::Complete.tool_results`) paths so they emit identical `[name] …` lines. `default` uses `brief_action(tool_name)` from `llm/tools/descriptions.rs`; `minimal` uses `build_description`; `full` appends a result snippet capped at `TOOL_DISPLAY_FULL_RESULT_CAP`.
 - `THINKING_DISPLAY` (`off` | `inline` | `full`) — `App::thinking_text: Option<String>` accumulates `StreamChunk::ThinkingDelta` fragments; `App::finalize_thinking_for_round` is called at every round boundary (`IntermediateAssistant`, `IntermediateTool`, `StreamComplete`) and is idempotent. `inline` shows a dimmed `[Thinking… (N chars)]` line above the streaming buffer and discards on finalize; `full` streams reasoning live and pushes a permanent `ChatRole::Thinking` entry on finalize.
 
+### Slash commands
+
+Dispatched by `dispatch_slash_command` in `src/tui/mod.rs`. Typing `/` in the chat input opens an autocomplete popup; arrow keys + Enter pick a command. Some commands open a secondary picker (e.g. `/model` with no arg lists models from the provider; `/thinking` / `/tool-verbosity` / `/reasoning` show a static picker of valid values).
+
+| Command | Action |
+|---------|--------|
+| `/clear` | Clear conversation |
+| `/exit` | Quit |
+| `/dir <path>` | Change working directory |
+| `/model [name]` | Switch model (opens picker if no arg) — persisted via `storage::persist_setting` |
+| `/streaming` | Toggle streaming responses — persisted |
+| `/thinking <off\|inline\|full>` | Set `THINKING_DISPLAY` — persisted |
+| `/tool-verbosity <default\|minimal\|full>` | Set `TOOL_DISPLAY_VERBOSITY` — persisted |
+| `/reasoning <…>` | Set OpenRouter reasoning effort — persisted |
+| `/skip-confirmations` | Toggle confirmation gate **for the current session only** (not persisted — always starts safe) |
+| `/sessions` | List recent sessions for this project (from `storage`) |
+| `/resume <id>` | Reload a prior session's conversation |
+
 ### Keyboard shortcuts (runtime)
 
 | Key | Action |
 |-----|--------|
-| Enter | Send message |
+| Enter | Send message / confirm slash-command pick / expand tree node |
 | Ctrl+C | Quit |
 | Ctrl+L | Clear conversation |
 | Tab | Switch focus: Chat ↔ File Tree |
-| ↑ / ↓ | Scroll focused panel |
+| ↑ / ↓ | Scroll focused panel / move within slash-command popup |
 | → / Enter (tree) | Expand selected directory |
 | ← (tree) | Collapse directory / jump to parent |
-| `/dir <path>` | Change working directory |
+| Esc | Close slash popup / cancel in-flight request / reject confirmation |
 | y / n / Esc | Confirm / cancel destructive tool (Confirming mode) |

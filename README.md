@@ -13,6 +13,10 @@ A terminal UI for AI-assisted file management. Chat with an LLM to inspect and c
 - Context guard: warns before the conversation approaches the configured token budget.
 - Tool display verbosity: pick how detailed each Tool entry is in chat — brief action, parametrized description, or description plus a capped result snippet.
 - Reasoning visibility: optionally surface the model's thinking tokens as a live indicator or a permanent dimmed transcript entry.
+- Slash commands with autocomplete: `/dir`, `/model`, `/streaming`, `/thinking`, `/tool-verbosity`, `/reasoning`, `/skip-confirmations`, `/clear`, `/sessions`, `/resume`, `/exit`.
+- Session persistence: conversations are saved per project to a SQLite store; resume a prior session with `/resume <id>`.
+- Interactive configuration wizard: `foxmayn-cowork config` writes `~/.config/foxmayn-cowork/.env` (also runs automatically on first launch).
+- Ollama tool-support preflight: refuses to launch against an Ollama model whose `capabilities` does not declare `tools`, with a clear pointer to a working alternative.
 
 ## Install
 
@@ -56,6 +60,14 @@ cargo build --release --features local-cuda     # + CUDA GPU (NVIDIA)
 
 ## Setup
 
+The first time you launch `foxmayn-cowork` with no config present, an interactive wizard runs and writes `~/.config/foxmayn-cowork/.env`. Re-run it any time with:
+
+```bash
+foxmayn-cowork config
+```
+
+To configure manually, or for development from a clone:
+
 **OpenRouter (default):**
 
 ```bash
@@ -94,7 +106,23 @@ PROVIDER=local ./target/release/foxmayn-cowork --dir /path/to/dir
 
 Type a message and press **Enter** to send. Use **Shift+Enter** or **Alt+Enter** for a newline; multi-line paste is supported. Press **Esc** to cancel an in-flight request.
 
-Use `/dir <path>` to switch the working directory at any time. The file tree refreshes after successful AI operations.
+Type `/` in the chat input to open the slash-command autocomplete; arrow keys + Enter pick a command. Available commands:
+
+| Command | Effect |
+| --- | --- |
+| `/dir <path>` | Switch the working directory |
+| `/model [name]` | Change model (opens a picker if no name given) |
+| `/streaming` | Toggle token streaming |
+| `/thinking <off\|inline\|full>` | Reasoning visibility |
+| `/tool-verbosity <default\|minimal\|full>` | Tool entry detail |
+| `/reasoning <effort>` | OpenRouter reasoning effort |
+| `/skip-confirmations` | Toggle the destructive-op confirmation gate **for this session only** (never persisted) |
+| `/sessions` | List saved sessions for the current project |
+| `/resume <id>` | Reload a prior session |
+| `/clear` | Clear the conversation |
+| `/exit` | Quit |
+
+The file tree refreshes after successful AI operations.
 
 Destructive operations ask for confirmation by default. To give the AI full write/delete/rename power without prompts, launch with `--skip-confirmations` or set `SKIP_CONFIRMATIONS=true`. This is intentionally dangerous; use it only inside a directory you are comfortable letting the model mutate.
 
@@ -149,11 +177,12 @@ Environment variables are read from `.env` when present. CLI flags override matc
 
 ## Debug / probe mode
 
-The `probe` subcommand sends a single message directly to the Ollama HTTP API and prints the raw JSON request, response, and any tool round-trips to stdout without starting the TUI. Useful for diagnosing provider issues or iterating on tool schemas.
+The `probe` subcommand sends a single message directly to the Ollama HTTP API and prints the raw JSON request, response, and any tool round-trips to stdout without starting the TUI. Useful for diagnosing provider issues or iterating on tool schemas. Pass `--stream` to exercise the streaming chunk-assembler — the same code path the TUI uses — and print each tool-call delta as it arrives.
 
 ```bash
-foxmayn-cowork probe "list all .md files"          # uses cwd, default message
+foxmayn-cowork probe "list all .md files"                       # non-streaming
 foxmayn-cowork probe "summarise report.pdf" --dir /path/to/dir
+foxmayn-cowork probe --stream "what does CLAUDE.md say?"        # streaming
 ```
 
 ## Development
