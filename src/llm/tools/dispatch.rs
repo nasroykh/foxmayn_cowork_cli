@@ -7,9 +7,8 @@ use crate::llm::types::FunctionCall;
 
 use super::descriptions::{build_confirmation_description, build_description};
 use super::validate::{
-    extract_bool, extract_rename_operations, extract_str, extract_str_array,
-    resolve_paths, resolve_rename_operations, validate_generated_filename,
-    validate_path_containment,
+    extract_bool, extract_rename_operations, extract_str, extract_str_array, resolve_paths,
+    resolve_rename_operations, validate_generated_filename, validate_path_containment,
 };
 
 pub const MAX_BULK_MATCHES: usize = 200;

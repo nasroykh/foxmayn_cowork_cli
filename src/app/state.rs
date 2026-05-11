@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, ThinkingDisplay};
@@ -9,6 +10,7 @@ use crate::error::AppError;
 use crate::fs::FileEntry;
 use crate::llm::runtime::LlmRuntime;
 use crate::llm::types::StreamChunk;
+use crate::storage::Storage;
 
 use super::events::{LlmOutcome, RequestId};
 
@@ -38,6 +40,44 @@ impl TreeEntry {
     }
 }
 
+// ── Slash picker ─────────────────────────────────────────────────────────────
+
+/// A single selectable item inside the interactive slash picker.
+pub struct SlashPickerItem {
+    /// Text shown in the popup row.
+    pub display: String,
+    /// Value substituted as the command argument on selection.
+    pub value: String,
+}
+
+/// Interactive picker state — shown instead of the completions popup when a
+/// picker-capable command (e.g. `/resume`) is entered without an argument.
+pub struct SlashPicker {
+    /// The command that owns this picker (e.g. `"/resume"`).
+    pub command: &'static str,
+    pub items: Vec<SlashPickerItem>,
+    pub selected: usize,
+}
+
+impl SlashPicker {
+    pub fn select_prev(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .checked_sub(1)
+            .unwrap_or(self.items.len() - 1);
+    }
+
+    pub fn select_next(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.items.len();
+    }
+}
+
 // ── Input / focus state ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,7 +94,7 @@ pub enum Panel {
 
 // ── Display types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChatRole {
     User,
     Assistant,
@@ -65,7 +105,7 @@ pub enum ChatRole {
     Warning,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatEntry {
     pub role: ChatRole,
     pub content: String,
@@ -116,10 +156,23 @@ pub struct App {
     /// from cancelled or superseded tasks can be ignored safely.
     pub active_request_id: Option<RequestId>,
     next_request_id: RequestId,
+    /// Indices into `tui::commands::COMMANDS` that match the current slash prefix. Empty when
+    /// the input does not start with `/` or no commands match.
+    pub slash_completions: Vec<usize>,
+    /// Which entry in `slash_completions` is currently highlighted.
+    pub slash_selected: usize,
+    /// Persistent storage (global settings DB + current project DB).
+    pub storage: Storage,
+    /// Row id of the current open session in the project DB. `None` until the first
+    /// completed exchange (session is created lazily with the first user message as title).
+    pub current_session_id: Option<i64>,
+    /// Active interactive picker (e.g. session list for `/resume`). Mutually exclusive
+    /// with `slash_completions` — when this is `Some`, the picker popup is rendered instead.
+    pub slash_picker: Option<SlashPicker>,
 }
 
 impl App {
-    pub fn new(config: Arc<Config>, llm_runtime: LlmRuntime) -> Self {
+    pub fn new(config: Arc<Config>, llm_runtime: LlmRuntime, storage: Storage) -> Self {
         Self {
             config,
             llm_runtime,
@@ -142,7 +195,48 @@ impl App {
             current_request: None,
             active_request_id: None,
             next_request_id: 1,
+            slash_completions: Vec::new(),
+            slash_selected: 0,
+            storage,
+            current_session_id: None,
+            slash_picker: None,
         }
+    }
+
+    /// Recompute slash completions from the current textarea content.
+    /// Call this after every keystroke while in Editing mode.
+    pub fn update_slash_completions(&mut self, input: &str) {
+        let first_line = input.lines().next().unwrap_or(input);
+        if first_line.starts_with('/') {
+            // Match only on the command word (before any space / argument)
+            let word = first_line.split_whitespace().next().unwrap_or(first_line);
+            let matches = crate::tui::commands::match_commands(word);
+            // Keep the selected index clamped; reset to 0 only when the list changes
+            if matches != self.slash_completions {
+                self.slash_selected = 0;
+            }
+            self.slash_completions = matches;
+        } else {
+            self.slash_completions.clear();
+            self.slash_selected = 0;
+        }
+    }
+
+    pub fn slash_select_prev(&mut self) {
+        if self.slash_completions.is_empty() {
+            return;
+        }
+        self.slash_selected = self
+            .slash_selected
+            .checked_sub(1)
+            .unwrap_or(self.slash_completions.len() - 1);
+    }
+
+    pub fn slash_select_next(&mut self) {
+        if self.slash_completions.is_empty() {
+            return;
+        }
+        self.slash_selected = (self.slash_selected + 1) % self.slash_completions.len();
     }
 
     pub fn allocate_request_id(&mut self) -> RequestId {
@@ -305,7 +399,11 @@ impl App {
     }
 
     /// Apply the result of a completed send_message or confirm_tool task.
-    pub fn handle_outcome(&mut self, outcome: LlmOutcome, updated_conversation: Vec<crate::llm::types::Message>) {
+    pub fn handle_outcome(
+        &mut self,
+        outcome: LlmOutcome,
+        updated_conversation: Vec<crate::llm::types::Message>,
+    ) {
         self.conversation = updated_conversation;
         self.is_loading = false;
 
@@ -488,6 +586,9 @@ impl App {
 
     pub fn set_working_dir(&mut self, path: PathBuf) {
         self.abort_in_flight();
+        // Open (or create) the per-project DB before moving `path`.
+        self.storage.open_project(&path);
+        self.current_session_id = None;
         self.working_dir = Some(path);
         self.conversation.clear();
         self.chat_messages.clear();
@@ -507,6 +608,73 @@ impl App {
         self.streaming_text = None;
         self.thinking_text = None;
         self.input_mode = InputMode::Editing;
+        self.current_session_id = None;
+    }
+
+    /// Persist the current conversation to the project DB. Creates the session row on the first
+    /// call (using the first user message as the title). Silently no-ops when no project is open.
+    pub fn save_current_session(&mut self) {
+        if self.storage.project.is_none() || self.conversation.is_empty() {
+            return;
+        }
+        let conv_json = match serde_json::to_string(&self.conversation) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let chat_json = match serde_json::to_string(&self.chat_messages) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if self.current_session_id.is_none() {
+            let title: String = self
+                .conversation
+                .iter()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.chars().take(60).collect())
+                .unwrap_or_else(|| "Untitled".to_string());
+            if let Some(project) = self.storage.project.as_ref() {
+                match project.create_session(&title) {
+                    Ok(id) => self.current_session_id = Some(id),
+                    Err(_) => return,
+                }
+            }
+        }
+        if let (Some(id), Some(project)) =
+            (self.current_session_id, self.storage.project.as_ref())
+        {
+            let _ = project.save_session(id, &conv_json, &chat_json);
+        }
+    }
+
+    /// Return recent sessions for the current project (up to 20, newest first).
+    pub fn list_sessions(&self) -> Vec<crate::storage::SessionSummary> {
+        self.storage
+            .project
+            .as_ref()
+            .and_then(|p| p.list_sessions().ok())
+            .unwrap_or_default()
+    }
+
+    /// Load a past session into memory. Returns `false` if the id is not found or no project
+    /// is open. The loaded session becomes the active one (subsequent saves update it).
+    pub fn resume_session(&mut self, id: i64) -> bool {
+        let Some(project) = self.storage.project.as_ref() else {
+            return false;
+        };
+        let Some((conv_json, chat_json)) = project.load_session(id).ok().flatten() else {
+            return false;
+        };
+        let Ok(conv) = serde_json::from_str(&conv_json) else {
+            return false;
+        };
+        let Ok(msgs) = serde_json::from_str::<Vec<ChatEntry>>(&chat_json) else {
+            return false;
+        };
+        self.conversation = conv;
+        self.chat_messages = msgs;
+        self.current_session_id = Some(id);
+        self.chat_scroll = 0;
+        true
     }
 
     pub fn scroll_chat_up(&mut self) {
@@ -530,4 +698,3 @@ impl App {
             .min(self.file_tree.len().saturating_sub(1));
     }
 }
-

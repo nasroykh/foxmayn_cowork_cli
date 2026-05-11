@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod fs;
 mod llm;
+mod storage;
 mod tui;
 
 use std::path::PathBuf;
@@ -62,7 +63,7 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
-    let config = Config::from_env().with_overrides(
+    let base_config = Config::from_env().with_overrides(
         cli.provider,
         cli.model,
         cli.streaming,
@@ -70,9 +71,13 @@ async fn main() {
     );
 
     if let Some(Commands::Probe { message, dir }) = cli.command {
-        probe(config, message, dir).await;
+        probe(base_config, message, dir).await;
         return;
     }
+
+    // Open persistent storage and layer saved settings on top of env/CLI config.
+    let storage = storage::Storage::open();
+    let config = storage::apply_saved_settings(base_config, &storage);
 
     if let Err(msg) = preflight(&config) {
         eprintln!("{msg}");
@@ -92,7 +97,7 @@ async fn main() {
         }
     };
 
-    let mut app = App::new(Arc::new(config), llm_runtime);
+    let mut app = App::new(Arc::new(config), llm_runtime, storage);
 
     if let Some(dir) = cli.dir {
         app.set_working_dir(dir);
@@ -199,10 +204,7 @@ async fn probe(config: Config, message: String, dir: PathBuf) {
         println!("content      : {:?}", assistant_msg.content);
         println!(
             "tool_calls # : {}",
-            assistant_msg
-                .tool_calls
-                .as_ref()
-                .map_or(0, Vec::len)
+            assistant_msg.tool_calls.as_ref().map_or(0, Vec::len)
         );
         println!();
 

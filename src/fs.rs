@@ -279,8 +279,7 @@ pub async fn matching_files(
             let file_type = entry.file_type().await?;
 
             if file_type.is_dir() {
-                if recursive && !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str())
-                {
+                if recursive && !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
                     dirs_to_visit.push(path.to_string_lossy().into_owned());
                 }
             } else if file_type.is_file() && re.is_match(&name) {

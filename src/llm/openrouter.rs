@@ -43,9 +43,7 @@ fn to_openrouter_body(request: &ChatRequest) -> serde_json::Value {
         for msg in messages.iter_mut() {
             if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
                 for tc in tool_calls.iter_mut() {
-                    if let Some(args) = tc
-                        .get_mut("function")
-                        .and_then(|f| f.get_mut("arguments"))
+                    if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
                         && !args.is_string()
                     {
                         *args = serde_json::Value::String(args.to_string());

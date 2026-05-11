@@ -178,11 +178,11 @@ pub async fn build_confirmation_description(
     call: &FunctionCall,
     base_path: &std::path::Path,
 ) -> Result<String, crate::error::AppError> {
+    use super::dispatch::{matching_files_for_call, matching_rename_plan};
     use super::validate::{
         extract_bool, extract_rename_operations, extract_str_array, resolve_paths,
         resolve_rename_operations,
     };
-    use super::dispatch::{matching_files_for_call, matching_rename_plan};
 
     let args = &call.arguments;
     match call.name.as_str() {

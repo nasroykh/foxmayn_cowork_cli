@@ -8,4 +8,4 @@ mod system_prompt;
 
 pub use entry::{confirm_tool, confirm_tool_streaming, send_message, send_message_streaming};
 pub use events::{AppEvent, LlmOutcome};
-pub use state::{App, ChatEntry, ChatRole, InputMode, Panel};
+pub use state::{App, ChatEntry, ChatRole, InputMode, Panel, SlashPicker, SlashPickerItem};

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"
+tui-markdown = "=0.3.6"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -23,6 +24,9 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 regex = "1"
 pdf-extract = "0.7"
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Optional: local LLM inference via llama.cpp
 llama-cpp-2 = { version = "0.1", optional = true, features = ["sampler"] }

@@ -14,9 +14,21 @@ run dir:
 run-self:
     cargo run -- --dir .
 
-# Run with Ollama instead of OpenRouter
+# Run with Ollama
 run-ollama dir:
     cargo run -- --dir {{dir}} --provider ollama
+
+# Run with OpenRouter
+run-openrouter dir:
+    cargo run -- --dir {{dir}} --provider openrouter
+
+# Run with Ollama pointing at the project itself
+run-ollama-self:
+    cargo run -- --dir . --provider ollama
+
+# Run with OpenRouter pointing at the project itself
+run-openrouter-self:
+    cargo run -- --dir . --provider open-router
 
 # Run with a specific model override
 run-model dir model:

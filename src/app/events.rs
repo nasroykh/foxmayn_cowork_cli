@@ -52,6 +52,8 @@ pub enum AppEvent {
     },
     /// Near-context-limit warning to display in chat before proceeding.
     ContextWarning(String),
+    /// Available models fetched asynchronously (Ollama /api/tags). Opens the model picker.
+    ModelsLoaded(Vec<String>),
     /// Intermediate assistant text from a multi-round agentic loop. Flushes any
     /// in-progress streaming buffer to a permanent chat entry so subsequent
     /// rounds start fresh.
