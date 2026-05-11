@@ -4,7 +4,7 @@ pub enum AppError {
     Fs(#[from] std::io::Error),
 
     #[error("Request failed: {0}")]
-    OllamaRequest(#[from] reqwest::Error),
+    Http(#[from] reqwest::Error),
 
     #[error("LLM returned invalid response: {0}")]
     LlmError(String),

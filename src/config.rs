@@ -3,7 +3,7 @@ use std::str::FromStr;
 use clap::ValueEnum;
 
 use crate::llm::types::{
-    OllamaThink, ReasoningEffort, ReasoningSummaryVerbosity, RequestReasoning,
+    OllamaThink, OllamaThinkLevel, ReasoningEffort, ReasoningSummaryVerbosity, RequestReasoning,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
@@ -124,7 +124,10 @@ fn env_bool(name: &str, default: bool) -> bool {
         .map(|v| match v.to_lowercase().as_str() {
             "true" | "1" | "on" | "yes" => true,
             "false" | "0" | "off" | "no" => false,
-            _ => default,
+            other => {
+                eprintln!("[config] unknown {name} value: {other:?} — using {default}");
+                default
+            }
         })
         .unwrap_or(default)
 }
@@ -188,12 +191,12 @@ fn tool_display_verbosity_from_env() -> ToolDisplayVerbosity {
     }
 }
 
-/// Ollama `think` per <https://docs.ollama.com/api/chat>. Omitted by default so non-thinking
-/// models are not broken. Set OLLAMA_THINK=low|medium|high|true to enable for thinking models.
+/// Ollama `think` per <https://docs.ollama.com/api/chat>. Defaults to `low` so thinking models
+/// work out of the box. Set OLLAMA_THINK=off to omit the field for non-thinking models.
 fn ollama_think_from_env() -> Option<OllamaThink> {
     let val = match std::env::var("OLLAMA_THINK") {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(_) => return Some(OllamaThink::Level(OllamaThinkLevel::Low)),
     };
     if val.is_empty() || val.eq_ignore_ascii_case("off") {
         return None;
@@ -201,8 +204,8 @@ fn ollama_think_from_env() -> Option<OllamaThink> {
     match val.parse::<OllamaThink>() {
         Ok(t) => Some(t),
         Err(e) => {
-            eprintln!("[config] OLLAMA_THINK: {e} -- omitting think field");
-            None
+            eprintln!("[config] OLLAMA_THINK: {e} -- using low");
+            Some(OllamaThink::Level(OllamaThinkLevel::Low))
         }
     }
 }

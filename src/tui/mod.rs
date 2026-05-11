@@ -433,6 +433,8 @@ fn check_context(
 }
 
 fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String) {
+    app.abort_in_flight();
+
     let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
     let conversation = app.conversation.clone();
@@ -481,6 +483,9 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
     let Some(pending) = app.pending_confirmation.clone() else {
         return;
     };
+
+    app.abort_in_flight();
+
     let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
     let working_dir = app.working_dir.clone();

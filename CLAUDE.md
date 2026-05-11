@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-just check          # cargo check (default)
+just check          # cargo check
 just lint           # cargo clippy -- -D warnings
 just fmt            # cargo fmt
 just ci             # fmt-check + lint + check in one shot
@@ -52,10 +52,19 @@ All async work is fire-and-forget (`tokio::spawn`). Results come back through an
 
 ### Key files
 
-- `src/app.rs` — `App` struct (all UI state), `run_agentic_loop` (drives LLM ↔ tool loop up to 10 rounds), `send_message` / `confirm_tool` (entry points for async tasks), `LlmOutcome` / `AppEvent` enums.
+- `src/app/` — App module (split from monolithic `app.rs`):
+  - `state.rs` — `App` struct + all `impl App` methods; `TreeEntry`, `ChatEntry`, `ChatRole`, `InputMode`, `Panel`, `PendingToolCall`
+  - `events.rs` — `AppEvent`, `LlmOutcome`, `RequestId`
+  - `agentic.rs` — `run_agentic_loop` (unified streaming + non-streaming; drives LLM ↔ tool loop up to `MAX_TOOL_ROUNDS`), `apply_confirmation_policy`, `format_tool_summary`
+  - `entry.rs` — four public entry points: `send_message`, `send_message_streaming`, `confirm_tool`, `confirm_tool_streaming`
+  - `system_prompt.rs` — `system_prompt`, `working_dir_summary`
 - `src/tui/mod.rs` — terminal setup/teardown, `run_loop` event multiplexer (`tokio::select!` over crossterm events, mpsc channel, and a 10-second health-check tick).
 - `src/tui/ui.rs` + `src/tui/widgets/` — ratatui rendering (chat panel, file tree, confirmation dialog).
-- `src/llm/tools.rs` — tool definitions sent to the LLM (`list_files`, `read_file`, `read_pdf`, `find_files`, `search_in_files`, `create_file`, `create_directory`, `copy_file`, `edit_file`, `patch_file`, `delete_file`, `delete_many`, `delete_matching`, `rename_file`, `rename_many`, `rename_matching`), `dispatch_tool_call` (gates destructive ops behind confirmation), `execute_tool` (executes after confirmation), `build_description` / `brief_action` (used by the chat-panel display verbosity), path containment validation.
+- `src/llm/tools/` — tools module (split from monolithic `tools.rs`):
+  - `schema.rs` — `tool_definitions()` (JSON schema for all 17 tools sent to the LLM)
+  - `dispatch.rs` — `dispatch_tool_call` (gates destructive ops behind confirmation), `execute_tool`, `DESTRUCTIVE_OPS`
+  - `validate.rs` — `validate_path_containment`, `resolve_paths`, path-safety helpers + tests
+  - `descriptions.rs` — `build_description`, `brief_action` (used by chat-panel display verbosity), confirmation text helpers
 - `src/llm/openrouter.rs` / `src/llm/ollama.rs` — provider-specific HTTP clients; `llm::mod.rs` dispatches to the right one based on `Config::provider`.
 - `src/llm/runtime.rs` — `LlmRuntime` (cheaply-cloneable handle holding `reqwest::Client` and, when `--features local`, an `Arc<LocalRuntime>`); built once at startup in `main.rs` and cloned into every spawned task.
 - `src/llm/local.rs` — `--features local` only; `LocalRuntime` (llama.cpp backend + model loaded once), `chat` / `chat_stream` (run inference in `spawn_blocking`, bridge result to `StreamChunk` channel), `build_prompt` (ChatML format), `parse_output` (JSON tool-call detection).
@@ -64,7 +73,7 @@ All async work is fire-and-forget (`tokio::spawn`). Results come back through an
 
 ### Tool confirmation flow
 
-`DESTRUCTIVE_OPS` (in `src/llm/tools.rs`) currently covers: `delete_file`, `delete_many`, `delete_matching`, `edit_file`, `patch_file`, `rename_file`, `rename_many`, `rename_matching`. When the LLM calls one, `dispatch_tool_call` returns `requires_confirmation: true` without executing. The TUI enters `InputMode::Confirming` and shows a confirmation widget. Pressing `y` calls `confirm_tool → execute_tool`; `n`/Esc cancels and returns `"Operation cancelled."` as a plain assistant message. With `--skip-confirmations` / `SKIP_CONFIRMATIONS=true`, `apply_confirmation_policy` executes the call inline and tags the description as `"… (confirmation skipped)"`.
+`DESTRUCTIVE_OPS` (in `src/llm/tools/dispatch.rs`) currently covers: `delete_file`, `delete_many`, `delete_matching`, `edit_file`, `patch_file`, `rename_file`, `rename_many`, `rename_matching`. When the LLM calls one, `dispatch_tool_call` returns `requires_confirmation: true` without executing. The TUI enters `InputMode::Confirming` and shows a confirmation widget. Pressing `y` calls `confirm_tool → execute_tool`; `n`/Esc cancels and returns `"Operation cancelled."` as a plain assistant message. With `--skip-confirmations` / `SKIP_CONFIRMATIONS=true`, `apply_confirmation_policy` executes the call inline and tags the description as `"… (confirmation skipped)"`.
 
 Read-only tools (`list_files`, `read_file`, `read_pdf`, `find_files`, `search_in_files`) and pure-creation tools (`create_file`, `create_directory`, `copy_file`) never require confirmation.
 
@@ -80,7 +89,7 @@ Three providers are supported, all dispatched through `llm::mod.rs` via `&LlmRun
 
 Two env vars control how live activity is rendered in the chat panel:
 
-- `TOOL_DISPLAY_VERBOSITY` (`default` | `minimal` | `full`) — handled by `format_tool_summary` in `src/app.rs`, used by both streaming (`AppEvent::IntermediateTool`) and non-streaming (`LlmOutcome::Complete.tool_results`) paths so they emit identical `[name] …` lines. `default` uses `brief_action(tool_name)` from `tools.rs`; `minimal` uses `build_description`; `full` appends a result snippet capped at `TOOL_DISPLAY_FULL_RESULT_CAP`.
+- `TOOL_DISPLAY_VERBOSITY` (`default` | `minimal` | `full`) — handled by `format_tool_summary` in `src/app/agentic.rs`, used by both streaming (`AppEvent::IntermediateTool`) and non-streaming (`LlmOutcome::Complete.tool_results`) paths so they emit identical `[name] …` lines. `default` uses `brief_action(tool_name)` from `llm/tools/descriptions.rs`; `minimal` uses `build_description`; `full` appends a result snippet capped at `TOOL_DISPLAY_FULL_RESULT_CAP`.
 - `THINKING_DISPLAY` (`off` | `inline` | `full`) — `App::thinking_text: Option<String>` accumulates `StreamChunk::ThinkingDelta` fragments; `App::finalize_thinking_for_round` is called at every round boundary (`IntermediateAssistant`, `IntermediateTool`, `StreamComplete`) and is idempotent. `inline` shows a dimmed `[Thinking… (N chars)]` line above the streaming buffer and discards on finalize; `full` streams reasoning live and pushes a permanent `ChatRole::Thinking` entry on finalize.
 
 ### Keyboard shortcuts (runtime)

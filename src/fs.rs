@@ -7,6 +7,18 @@ use crate::error::AppError;
 
 const MAX_READ_BYTES: u64 = 5_242_880; // 5 MB
 
+/// Directories skipped during recursive traversal (build artifacts, package managers,
+/// bytecode caches). Hidden directories (starting with `.`) are skipped separately.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "__pycache__",
+    "dist",
+    "build",
+    "vendor",
+    ".git",
+];
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEntry {
     pub name: String,
@@ -77,6 +89,11 @@ pub async fn create_file(path: String, content: String) -> Result<(), AppError> 
 }
 
 pub async fn edit_file(path: String, content: String) -> Result<(), AppError> {
+    if !fs::try_exists(&path).await? {
+        return Err(AppError::ToolValidation(format!(
+            "File does not exist: {path}. Use create_file to create a new file."
+        )));
+    }
     fs::write(&path, content).await?;
     Ok(())
 }
@@ -96,6 +113,16 @@ pub async fn delete_many(paths: Vec<String>) -> Result<usize, AppError> {
         return Err(AppError::ToolValidation(
             "No paths were provided for bulk delete".into(),
         ));
+    }
+
+    // Validate all paths exist before touching any of them so a mid-batch
+    // failure doesn't leave the filesystem in a partially-deleted state.
+    for path in &paths {
+        if !fs::try_exists(path).await? {
+            return Err(AppError::ToolValidation(format!(
+                "Path does not exist: {path}"
+            )));
+        }
     }
 
     let count = paths.len();
@@ -187,16 +214,31 @@ pub async fn search_in_files(
             let name = entry.file_name().to_string_lossy().into_owned();
 
             if path.is_dir() {
-                if !name.starts_with('.') && name != "node_modules" && name != "target" {
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str()) {
                     dirs_to_visit.push(path.to_string_lossy().into_owned());
                 }
-            } else if let Ok(content) = fs::read_to_string(&path).await {
-                let file_str = path.to_string_lossy();
-                for (line_num, line) in content.lines().enumerate() {
-                    if re.is_match(line) {
-                        total_matches += 1;
-                        if results.len() < max_results {
-                            results.push(format!("{}:{}: {}", file_str, line_num + 1, line.trim()));
+            } else {
+                // Skip files that exceed the read cap to avoid loading giant logs into RAM.
+                let too_large = fs::metadata(&path)
+                    .await
+                    .map(|m| m.len() > MAX_READ_BYTES)
+                    .unwrap_or(false);
+                if too_large {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&path).await {
+                    let file_str = path.to_string_lossy();
+                    for (line_num, line) in content.lines().enumerate() {
+                        if re.is_match(line) {
+                            total_matches += 1;
+                            if results.len() < max_results {
+                                results.push(format!(
+                                    "{}:{}: {}",
+                                    file_str,
+                                    line_num + 1,
+                                    line.trim()
+                                ));
+                            }
                         }
                     }
                 }
@@ -237,17 +279,17 @@ pub async fn matching_files(
             let file_type = entry.file_type().await?;
 
             if file_type.is_dir() {
-                if recursive && !name.starts_with('.') && name != "node_modules" && name != "target"
+                if recursive && !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_str())
                 {
                     dirs_to_visit.push(path.to_string_lossy().into_owned());
                 }
             } else if file_type.is_file() && re.is_match(&name) {
-                matches.push(path.to_string_lossy().into_owned());
-                if matches.len() > max_matches {
+                if matches.len() >= max_matches {
                     return Err(AppError::ToolValidation(format!(
                         "Matched more than {max_matches} files; narrow the pattern before running a bulk operation"
                     )));
                 }
+                matches.push(path.to_string_lossy().into_owned());
             }
         }
     }
