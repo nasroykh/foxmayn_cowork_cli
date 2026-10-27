@@ -194,3 +194,7 @@ just fmt        # cargo fmt
 just ci         # fmt-check + lint + check
 just doctor     # smoke-check toolchain, config, tests, and build
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
