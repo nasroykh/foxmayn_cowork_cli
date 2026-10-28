@@ -776,7 +776,7 @@ mod tests {
         assert!(canon.is_absolute());
         assert_eq!(
             canon,
-            std::env::current_dir().unwrap().canonicalize().unwrap()
+            strip_verbatim_prefix(std::env::current_dir().unwrap().canonicalize().unwrap())
         );
     }
 
