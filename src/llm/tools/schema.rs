@@ -20,7 +20,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "read_file".into(),
-                description: "Read-only. Return the full text contents of a single file.".into(),
+                description: "Read-only. Return the full text contents of a single regular file (max 5 MB; devices and pipes are refused).".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -34,7 +34,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "read_pdf".into(),
-                description: "Read-only. Extract and return the text content of a PDF file.".into(),
+                description: "Read-only. Extract and return the text content of a PDF file (max 50 MB; extracted text is capped at 1,000,000 characters).".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -48,7 +48,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "create_file".into(),
-                description: "Create a NEW file with the given content. Fails if the file already exists. Use ONLY when the user has asked to create a file."
+                description: "Create a NEW file with the given content. Fails if the file already exists; it never overwrites. Parent directories are created as needed. Creating anything under a hidden path (any path component starting with '.', e.g. '.env', '.github/workflows/ci.yml') requires the user's confirmation. Use ONLY when the user has asked to create a file."
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -79,7 +79,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "delete_file".into(),
-                description: "Delete a single file or directory. Destructive and irreversible. Use ONLY when the user has explicitly asked to delete this exact path. Never call to 'clean up', 'tidy', or remove files the user did not name.".into(),
+                description: "Delete a single file or directory (directories are removed with everything inside). A symlink is removed as a link; its target is untouched. The working directory itself cannot be deleted. Destructive and irreversible. Use ONLY when the user has explicitly asked to delete this exact path. Never call to 'clean up', 'tidy', or remove files the user did not name.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -93,7 +93,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "delete_many".into(),
-                description: "Delete multiple explicit files or directories in one confirmed batch. Destructive and irreversible. Use ONLY when the user has explicitly listed several paths to delete; prefer this over repeated `delete_file` calls in that case.".into(),
+                description: "Delete multiple explicit files or directories in one confirmed batch. Every path is validated first; the working directory itself cannot be deleted. Destructive and irreversible. Use ONLY when the user has explicitly listed several paths to delete; prefer this over repeated `delete_file` calls in that case.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -111,7 +111,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "rename_file".into(),
-                description: "Rename or move a single file or directory. Use ONLY when the user has explicitly asked to rename or move this path.".into(),
+                description: "Rename or move a single file or directory. Fails if the destination already exists (nothing is overwritten); renaming a symlink renames the link itself. The working directory itself cannot be renamed. Use ONLY when the user has explicitly asked to rename or move this path.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -184,7 +184,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "create_directory".into(),
-                description: "Create a new directory. Parent directories are created as needed. Fails if the path already exists. Use ONLY when the user has asked to create a directory.".into(),
+                description: "Create a new directory. Parent directories are created as needed. Fails if the path already exists. Creating a directory under a hidden path (any component starting with '.') requires the user's confirmation. Use ONLY when the user has asked to create a directory.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -198,7 +198,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "copy_file".into(),
-                description: "Copy a single file to a new location. Fails if the destination already exists. Use ONLY when the user has asked to copy a file.".into(),
+                description: "Copy a single regular file to a new location. Fails if the destination already exists; it never overwrites (delete the destination first if the user wants that). A destination under a hidden path (any component starting with '.') requires the user's confirmation. Use ONLY when the user has asked to copy a file.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -213,7 +213,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "find_files".into(),
-                description: "Read-only. Find files under a directory, optionally filtered by a filename regex. Returns matching file paths (capped at 200). Use this whenever you need to list, count, enumerate, or categorize files. To get EVERY file (e.g. for a filetype breakdown of the whole repo), call with `path: '.'`, `recursive: true`, and OMIT `filename_regex` (it defaults to matching all files). Skips hidden directories and build artifacts.".into(),
+                description: "Read-only. Find files under a directory, optionally filtered by a filename regex. Returns matching file paths (at most 200; a note says when more exist). Symlinks are not followed. Use this whenever you need to list, count, enumerate, or categorize files. To get EVERY file (e.g. for a filetype breakdown of the whole repo), call with `path: '.'`, `recursive: true`, and OMIT `filename_regex` (it defaults to matching all files). Skips hidden directories and build artifacts.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -229,7 +229,7 @@ pub fn tool_definitions() -> Vec<Tool> {
             r#type: "function".into(),
             function: ToolFunction {
                 name: "search_in_files".into(),
-                description: "Read-only. Search for a regex pattern inside the CONTENTS of files under a directory (grep-style). Returns matching lines with file paths and line numbers. For finding files by NAME or extension, use `find_files` instead. Skips hidden directories and build artifacts.".into(),
+                description: "Read-only. Search for a regex pattern inside the CONTENTS of files under a directory (grep-style). Returns matching lines with file paths and line numbers. For finding files by NAME or extension, use `find_files` instead. Skips hidden directories, build artifacts (node_modules, target, dist, build, vendor, virtualenvs, caches), symlinks, binary files and files over 5 MB. Long lines are shortened to 300 characters.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
