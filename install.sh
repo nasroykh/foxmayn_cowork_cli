@@ -1,17 +1,13 @@
 #!/usr/bin/env sh
-set -e
+set -eu
 
 REPO="nasroykh/foxmayn_cowork_cli"
 BINARY="foxmayn-cowork"
 
 # --- auth header ---
-# Prefer GITHUB_TOKEN env var; fall back to `gh auth token` if gh is installed.
-if [ -z "$GITHUB_TOKEN" ] && command -v gh > /dev/null 2>&1; then
-  GITHUB_TOKEN=$(gh auth token 2>/dev/null || true)
-fi
-
+# Opt-in only: set GITHUB_TOKEN (needed for private repos or API rate limits).
 AUTH_HEADER=""
-if [ -n "$GITHUB_TOKEN" ]; then
+if [ -n "${GITHUB_TOKEN:-}" ]; then
   AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
 fi
 
@@ -59,14 +55,19 @@ case "${OS}_${ARCH}" in
 esac
 
 # --- resolve latest release tag ---
-VERSION=$(fetch "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep '"tag_name"' \
-  | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+# Override with FOXMAYN_VERSION=vX.Y.Z to pin a version (also avoids API rate limits).
+VERSION="${FOXMAYN_VERSION:-}"
+if [ -z "$VERSION" ]; then
+  RELEASE_JSON=$(fetch "https://api.github.com/repos/${REPO}/releases/latest" || true)
+  VERSION=$(printf '%s\n' "$RELEASE_JSON" \
+    | grep '"tag_name"' \
+    | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)
+fi
 
 if [ -z "$VERSION" ]; then
   echo "Could not determine latest release version." >&2
-  echo "If the repo is private, make sure gh is installed and you are logged in (gh auth login)," >&2
-  echo "or set GITHUB_TOKEN before running this script." >&2
+  echo "Set FOXMAYN_VERSION=vX.Y.Z to pin a version, or set GITHUB_TOKEN" >&2
+  echo "if you hit API rate limits or the repo is private." >&2
   exit 1
 fi
 
@@ -89,8 +90,12 @@ if command -v sha256sum > /dev/null 2>&1; then
   sha256sum -c "${ARCHIVE}.sha256"
 elif command -v shasum > /dev/null 2>&1; then
   shasum -a 256 -c "${ARCHIVE}.sha256"
+elif [ "${FOXMAYN_COWORK_SKIP_CHECKSUM:-}" = "1" ]; then
+  echo "Warning: no sha256 tool found, FOXMAYN_COWORK_SKIP_CHECKSUM=1 set: skipping verification." >&2
 else
-  echo "Warning: no sha256 tool found, skipping checksum verification." >&2
+  echo "Error: no sha256sum or shasum found; cannot verify download." >&2
+  echo "Install one, or set FOXMAYN_COWORK_SKIP_CHECKSUM=1 to skip (not recommended)." >&2
+  exit 1
 fi
 cd - > /dev/null
 
