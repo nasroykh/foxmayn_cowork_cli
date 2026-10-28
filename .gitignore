@@ -31,3 +31,5 @@ node_modules/
 # Mac/Windows system files
 Thumbs.db
 ehthumbs.db
+# Local agent skills/config (kept on disk, not tracked)
+.agents/
