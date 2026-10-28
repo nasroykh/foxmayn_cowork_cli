@@ -268,6 +268,26 @@ fn str_arg<'a>(call: &'a FunctionCall, key: &str) -> Result<&'a str, AppError> {
         .ok_or_else(|| AppError::ToolValidation(format!("Missing required argument '{key}'")))
 }
 
+/// Bulk confirmations list every item: the dialog scrolls, and the fs layer already caps bulk
+/// operations, so nothing the user approves may be hidden behind "... and N more".
+const LIST_ALL: usize = usize::MAX;
+
+/// Base-relative display of paths about to be removed. A real directory is flagged because
+/// deleting it removes everything inside it.
+fn label_removals(paths: &[String], base: &Path) -> Vec<String> {
+    paths
+        .iter()
+        .map(|p| {
+            let path = Path::new(p);
+            let shown = relative_display(path, base);
+            match std::fs::symlink_metadata(path) {
+                Ok(m) if m.is_dir() => format!("{shown}/ (directory, recursive)"),
+                _ => shown,
+            }
+        })
+        .collect()
+}
+
 pub async fn build_confirmation_description(
     call: &FunctionCall,
     base_path: &Path,
@@ -346,11 +366,11 @@ pub async fn build_confirmation_description(
         "delete_many" => {
             let paths = extract_str_array(args, "paths")?;
             let resolved = resolve_paths(paths, base_path)?;
-            let shown: Vec<String> = resolved.iter().map(rel).collect();
+            let shown = label_removals(&resolved, &base);
             Ok(format!(
                 "Delete {} item(s)?\n\n{}",
                 shown.len(),
-                preview_paths(&shown, 12)
+                preview_paths(&shown, LIST_ALL)
             ))
         }
         "delete_matching" => {
@@ -361,7 +381,7 @@ pub async fn build_confirmation_description(
                 .unwrap_or("?");
             let recursive = extract_bool(args, "recursive");
             let matches = matching_files_for_call(args, base_path).await?;
-            let shown: Vec<String> = matches.iter().map(rel).collect();
+            let shown = label_removals(&matches, &base);
             let dir = relative_display(&validate_path_containment(path, base_path)?, &base);
             Ok(format!(
                 "Delete {} file(s) matching /{}/ under {} (recursive: {})?\n\n{}",
@@ -369,7 +389,7 @@ pub async fn build_confirmation_description(
                 truncate_for_display(pattern, 80),
                 dir,
                 recursive,
-                preview_paths(&shown, 12)
+                preview_paths(&shown, LIST_ALL)
             ))
         }
         "rename_many" => {
@@ -380,7 +400,7 @@ pub async fn build_confirmation_description(
             Ok(format!(
                 "Rename {} item(s)?\n\n{}",
                 shown.len(),
-                preview_renames(&shown, 10)
+                preview_renames(&shown, LIST_ALL)
             ))
         }
         "rename_matching" => {
@@ -400,7 +420,7 @@ pub async fn build_confirmation_description(
                 truncate_for_display(pattern, 80),
                 dir,
                 recursive,
-                preview_renames(&shown, 10)
+                preview_renames(&shown, LIST_ALL)
             ))
         }
         _ => Ok(build_description(call)),
@@ -438,6 +458,34 @@ mod tests {
     #[test]
     fn preview_text_strips_control_characters() {
         assert_eq!(preview_text("a\x1b[31mb\tc", 10, 600), "a[31mb c");
+    }
+
+    #[test]
+    fn label_removals_flags_directories_as_recursive() {
+        let base = std::env::temp_dir().join(format!("fcw-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("dir")).unwrap();
+        std::fs::write(base.join("f.txt"), "x").unwrap();
+        let paths = vec![
+            base.join("dir").to_string_lossy().into_owned(),
+            base.join("f.txt").to_string_lossy().into_owned(),
+            base.join("gone").to_string_lossy().into_owned(),
+        ];
+        let out = label_removals(&paths, &base);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(out, ["dir/ (directory, recursive)", "f.txt", "gone"]);
+    }
+
+    #[test]
+    fn list_all_shows_every_item() {
+        let paths: Vec<String> = (0..200).map(|i| format!("f{i}")).collect();
+        let out = preview_paths(&paths, LIST_ALL);
+        assert_eq!(out.lines().count(), 200);
+        assert!(!out.contains("more"));
+        let ops: Vec<(String, String)> = (0..200)
+            .map(|i| (format!("a{i}"), format!("b{i}")))
+            .collect();
+        assert_eq!(preview_renames(&ops, LIST_ALL).lines().count(), 200);
     }
 
     #[test]

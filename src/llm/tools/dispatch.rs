@@ -555,12 +555,35 @@ mod tests {
             "{}",
             bulk.description
         );
-        assert!(
-            bulk.description.contains("(20 total)"),
-            "{}",
-            bulk.description
-        );
+        for i in 0..20 {
+            assert!(
+                bulk.description.contains(&format!("x{i}.log")),
+                "{}",
+                bulk.description
+            );
+        }
+        assert!(!bulk.description.contains("more"), "{}", bulk.description);
         assert!(bulk.description.contains("under ."), "{}", bulk.description);
+    }
+
+    #[tokio::test]
+    async fn delete_many_marks_directories_as_recursive() {
+        let (_tmp, base) = project();
+        std::fs::create_dir(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub/a.txt"), "x").unwrap();
+        std::fs::write(base.join("f.txt"), "x").unwrap();
+        let out = dispatch_tool_call(
+            &call("delete_many", json!({"paths": ["sub", "f.txt"]})),
+            &base,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.description.contains("- sub/ (directory, recursive)"),
+            "{}",
+            out.description
+        );
+        assert!(out.description.contains("- f.txt"), "{}", out.description);
     }
 
     #[tokio::test]
