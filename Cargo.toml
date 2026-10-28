@@ -1,10 +1,19 @@
 [package]
 name = "foxmayn_cowork_cli"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+# MSRV: highest dependency rust-version in the lockfile is 1.89 (rusqlite 0.41, uuid 1.29);
+# the code also needs let-chains (1.88). Checked in CI by the `msrv` job.
+rust-version = "1.89"
 license = "MIT"
 description = "Terminal UI for AI-assisted file management"
 repository = "https://github.com/nasroykh/foxmayn_cowork_cli"
+homepage = "https://github.com/nasroykh/foxmayn_cowork_cli"
+readme = "README.md"
+keywords = ["tui", "llm", "ai", "file-manager", "cli"]
+categories = ["command-line-utilities"]
+publish = false
+exclude = [".agents/", ".github/", "docs/"]
 
 [[bin]]
 name = "foxmayn-cowork"
@@ -40,3 +49,9 @@ local       = ["dep:llama-cpp-2", "dep:hf-hub"]
 # GPU acceleration variants (add on top of `local`)
 local-metal = ["local", "llama-cpp-2/metal"]
 local-cuda  = ["local", "llama-cpp-2/cuda"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# panic stays "unwind": the TUI panic hook must restore the terminal.
