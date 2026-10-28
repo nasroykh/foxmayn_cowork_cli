@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,8 @@ pub struct App {
     pub file_tree: Vec<TreeEntry>,
     pub input_mode: InputMode,
     pub pending_confirmation: Option<PendingToolCall>,
+    /// First visible row of the confirmation dialog's description (long bulk-op lists scroll).
+    pub confirm_scroll: usize,
     pub health_status: bool,
     pub is_loading: bool,
     /// Accumulates streaming text while a response is in progress. `None` when idle.
@@ -168,6 +170,9 @@ pub struct App {
     /// Active interactive picker (e.g. session list for `/resume`). Mutually exclusive
     /// with `slash_completions` — when this is `Some`, the picker popup is rendered instead.
     pub slash_picker: Option<SlashPicker>,
+    /// True while an async model-list fetch (`/model` on Ollama) is outstanding and the user has
+    /// not moved on. `ModelsLoaded` opens the picker only when this is still set.
+    pub model_picker_pending: bool,
 }
 
 impl App {
@@ -181,6 +186,7 @@ impl App {
             file_tree: Vec::new(),
             input_mode: InputMode::Editing,
             pending_confirmation: None,
+            confirm_scroll: 0,
             health_status: false,
             is_loading: false,
             streaming_text: None,
@@ -200,6 +206,7 @@ impl App {
             storage,
             current_session_id: None,
             slash_picker: None,
+            model_picker_pending: false,
         }
     }
 
@@ -322,19 +329,30 @@ impl App {
         }
     }
 
-    /// Abort the in-flight LLM request (if any) and reset transient UI state
-    /// so the user can immediately type a new prompt.
-    pub fn cancel_request(&mut self) -> bool {
-        let Some(handle) = self.current_request.take() else {
-            return false;
-        };
-        handle.abort();
+    /// Abort any in-flight request and reset every request-related UI field, silently. Used when
+    /// the conversation is replaced (Ctrl+L, /clear, /dir, /resume): clearing `active_request_id`
+    /// makes any event the dead task already queued stale, so a late reply cannot restore the
+    /// old conversation.
+    pub fn abort_current_request(&mut self) {
+        if let Some(h) = self.current_request.take() {
+            h.abort();
+        }
         self.active_request_id = None;
         self.is_loading = false;
         self.streaming_text = None;
         self.thinking_text = None;
-        self.input_mode = InputMode::Editing;
         self.pending_confirmation = None;
+        self.confirm_scroll = 0;
+        self.input_mode = InputMode::Editing;
+    }
+
+    /// Abort the in-flight LLM request (if any) and reset transient UI state
+    /// so the user can immediately type a new prompt.
+    pub fn cancel_request(&mut self) -> bool {
+        if self.current_request.is_none() && !self.is_loading {
+            return false;
+        }
+        self.abort_current_request();
         self.chat_messages.push(ChatEntry {
             role: ChatRole::Warning,
             content: "Request cancelled.".into(),
@@ -584,99 +602,103 @@ impl App {
         }
     }
 
-    pub fn set_working_dir(&mut self, path: PathBuf) {
-        self.abort_in_flight();
-        // Open (or create) the per-project DB before moving `path`.
-        self.storage.open_project(&path);
+    /// Switch to `path` (expanded, canonicalized, must be a directory). Returns the canonical
+    /// path on success; on error nothing changes. The canonical path is what keys the
+    /// per-project DB, so `--dir .` in two projects never shares sessions.
+    pub fn set_working_dir(&mut self, path: PathBuf) -> Result<PathBuf, String> {
+        let path = canonicalize_dir(&path)?;
+        self.abort_current_request();
+        let storage_error = self.storage.open_project(&path).err();
         self.current_session_id = None;
-        self.working_dir = Some(path);
+        self.working_dir = Some(path.clone());
         self.conversation.clear();
         self.chat_messages.clear();
         self.chat_cache.invalidate();
-        self.pending_confirmation = None;
-        self.input_mode = InputMode::Editing;
+        self.file_tree.clear();
         self.file_tree_scroll = 0;
         self.chat_scroll = 0;
         // Drop any expansion/scroll memory from the previous working dir.
         self.pending_expansions.clear();
         self.pending_scroll_path = None;
+        if let Some(e) = storage_error {
+            self.chat_messages.push(ChatEntry {
+                role: ChatRole::Warning,
+                content: format!("Sessions will not be saved for this directory: {e}"),
+            });
+        }
+        Ok(path)
     }
 
     pub fn clear_conversation(&mut self) {
+        self.abort_current_request();
         self.conversation.clear();
         self.chat_messages.clear();
         self.chat_cache.invalidate();
-        self.pending_confirmation = None;
-        self.streaming_text = None;
-        self.thinking_text = None;
-        self.input_mode = InputMode::Editing;
+        self.chat_scroll = 0;
         self.current_session_id = None;
     }
 
     /// Persist the current conversation to the project DB. Creates the session row on the first
-    /// call (using the first user message as the title). Silently no-ops when no project is open.
-    pub fn save_current_session(&mut self) {
+    /// call (using the first user message as the title). No-ops when no project is open.
+    pub fn save_current_session(&mut self) -> Result<(), String> {
         if self.storage.project.is_none() || self.conversation.is_empty() {
-            return;
+            return Ok(());
         }
-        let conv_json = match serde_json::to_string(&self.conversation) {
-            Ok(s) => s,
-            Err(_) => return,
+        let conv_json = serde_json::to_string(&self.conversation).map_err(|e| e.to_string())?;
+        let chat_json = serde_json::to_string(&self.chat_messages).map_err(|e| e.to_string())?;
+        let Some(project) = self.storage.project.as_ref() else {
+            return Ok(());
         };
-        let chat_json = match serde_json::to_string(&self.chat_messages) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if self.current_session_id.is_none() {
-            let title: String = self
-                .conversation
-                .iter()
-                .find(|m| m.role == "user")
-                .map(|m| m.content.chars().take(60).collect())
-                .unwrap_or_else(|| "Untitled".to_string());
-            if let Some(project) = self.storage.project.as_ref() {
-                match project.create_session(&title) {
-                    Ok(id) => self.current_session_id = Some(id),
-                    Err(_) => return,
-                }
+        let id = match self.current_session_id {
+            Some(id) => id,
+            None => {
+                let title: String = self
+                    .conversation
+                    .iter()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.chars().take(60).collect())
+                    .unwrap_or_else(|| "Untitled".to_string());
+                let id = project.create_session(&title).map_err(|e| e.to_string())?;
+                self.current_session_id = Some(id);
+                id
             }
-        }
-        if let (Some(id), Some(project)) = (self.current_session_id, self.storage.project.as_ref())
-        {
-            let _ = project.save_session(id, &conv_json, &chat_json);
-        }
+        };
+        project
+            .save_session(id, &conv_json, &chat_json)
+            .map_err(|e| e.to_string())
     }
 
     /// Return recent sessions for the current project (up to 20, newest first).
-    pub fn list_sessions(&self) -> Vec<crate::storage::SessionSummary> {
-        self.storage
-            .project
-            .as_ref()
-            .and_then(|p| p.list_sessions().ok())
-            .unwrap_or_default()
+    pub fn list_sessions(&self) -> Result<Vec<crate::storage::SessionSummary>, String> {
+        match self.storage.project.as_ref() {
+            Some(p) => p.list_sessions().map_err(|e| e.to_string()),
+            None => Ok(Vec::new()),
+        }
     }
 
-    /// Load a past session into memory. Returns `false` if the id is not found or no project
-    /// is open. The loaded session becomes the active one (subsequent saves update it).
-    pub fn resume_session(&mut self, id: i64) -> bool {
+    /// Load a past session into memory; it becomes the active one (subsequent saves update it).
+    /// Any in-flight request is aborted so a late reply can't overwrite the resumed session.
+    pub fn resume_session(&mut self, id: i64) -> Result<(), String> {
         let Some(project) = self.storage.project.as_ref() else {
-            return false;
+            return Err("No project open. Use /dir <path> first.".into());
         };
-        let Some((conv_json, chat_json)) = project.load_session(id).ok().flatten() else {
-            return false;
-        };
-        let Ok(conv) = serde_json::from_str(&conv_json) else {
-            return false;
-        };
-        let Ok(msgs) = serde_json::from_str::<Vec<ChatEntry>>(&chat_json) else {
-            return false;
-        };
+        let (conv_json, chat_json) = project
+            .load_session(id)
+            .map_err(|e| format!("Could not read session #{id}: {e}"))?
+            .ok_or_else(|| {
+                format!("Session #{id} not found. Use /sessions to list available sessions.")
+            })?;
+        let conv = serde_json::from_str(&conv_json)
+            .map_err(|e| format!("Session #{id} is corrupt (conversation): {e}"))?;
+        let msgs = serde_json::from_str::<Vec<ChatEntry>>(&chat_json)
+            .map_err(|e| format!("Session #{id} is corrupt (chat log): {e}"))?;
+        self.abort_current_request();
         self.conversation = conv;
         self.chat_messages = msgs;
         self.chat_cache.invalidate();
         self.current_session_id = Some(id);
         self.chat_scroll = 0;
-        true
+        Ok(())
     }
 
     pub fn scroll_chat_up(&mut self) {
@@ -698,5 +720,76 @@ impl App {
             .file_tree_scroll
             .saturating_add(1)
             .min(self.file_tree.len().saturating_sub(1));
+    }
+}
+
+// ── Working-directory helpers ─────────────────────────────────────────────────
+
+/// Expand a leading `~`, canonicalize, and require a directory. The result is stable per real
+/// directory (symlinks / `.` / `..` resolved), which the per-project storage key relies on.
+fn canonicalize_dir(path: &Path) -> Result<PathBuf, String> {
+    let expanded = match path.strip_prefix("~") {
+        Ok(rest) => match dirs::home_dir() {
+            Some(home) => home.join(rest),
+            None => path.to_path_buf(),
+        },
+        Err(_) => path.to_path_buf(),
+    };
+    let canon = std::fs::canonicalize(&expanded)
+        .map_err(|e| format!("Cannot open '{}': {e}", path.display()))?;
+    if !canon.is_dir() {
+        return Err(format!("'{}' is not a directory", path.display()));
+    }
+    Ok(strip_verbatim_prefix(canon))
+}
+
+/// Windows `canonicalize` returns `\\?\C:\…`; show and pass on the plain drive form.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_resolves_dot_to_absolute() {
+        let canon = canonicalize_dir(Path::new(".")).unwrap();
+        assert!(canon.is_absolute());
+        assert_eq!(
+            canon,
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn canonicalize_rejects_missing_and_files() {
+        assert!(canonicalize_dir(Path::new("/definitely/not/here")).is_err());
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(
+            canonicalize_dir(Path::new(file))
+                .unwrap_err()
+                .contains("not a directory")
+        );
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped_only_for_drive_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\proj")),
+            PathBuf::from(r"C:\proj")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\srv\share")),
+            PathBuf::from(r"\\?\UNC\srv\share")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from("/home/x")),
+            PathBuf::from("/home/x")
+        );
     }
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use chrono::{Local, TimeZone, Utc};
 
 use crossterm::{
+    cursor::Show,
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -25,48 +26,65 @@ use crate::config::{Config, Provider, ThinkingDisplay, ToolDisplayVerbosity};
 use crate::fs;
 use crate::llm;
 use crate::llm::types::{OllamaThink, OllamaThinkLevel, ReasoningEffort, RequestReasoning};
+use crate::storage;
 
 pub mod commands;
 pub mod ui;
 pub mod widgets;
 
+/// Minimum time between frames; stream chunks arriving faster are coalesced into one draw.
+const MIN_FRAME: Duration = Duration::from_millis(16);
+/// Health check cadence. Kept slow: the OpenRouter check is an authenticated request.
+const HEALTH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Restores the terminal on drop so every exit path (early `?`, error, unwind) leaves the
+/// shell usable.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        Show
+    );
+}
+
+/// Restore the terminal before the default hook prints, but only for panics on the main
+/// thread. Spawned tasks run on worker threads: a panic there must not tear the screen down
+/// while the app keeps running; `spawn_request` reports it as a chat error instead.
+fn install_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    let main_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == main_thread {
+            restore_terminal();
+            original_hook(info);
+        }
+    }));
+}
+
 pub async fn run(mut app: App) -> io::Result<()> {
+    install_panic_hook();
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    let _guard = TerminalGuard;
     execute!(
-        stdout,
+        io::stdout(),
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    // Restore terminal on panic so the shell isn't left in raw mode
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = crossterm::execute!(
-            io::stdout(),
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            DisableBracketedPaste
-        );
-        original_hook(info);
-    }));
-
-    let result = run_loop(&mut terminal, &mut app).await;
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
-    terminal.show_cursor()?;
-
-    result
+    run_loop(&mut terminal, &mut app).await
 }
 
 async fn run_loop<B: ratatui::backend::Backend<Error = io::Error>>(
@@ -83,26 +101,46 @@ async fn run_loop<B: ratatui::backend::Backend<Error = io::Error>>(
         spawn_file_tree_load(dir, tx.clone());
     }
 
-    // Periodic health check — first tick after 10 s so it doesn't duplicate the startup check
-    let start = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut health_tick = tokio::time::interval_at(start, Duration::from_secs(10));
+    // Periodic health check — first tick after one interval so it doesn't duplicate the startup check
+    let start = tokio::time::Instant::now() + HEALTH_INTERVAL;
+    let mut health_tick = tokio::time::interval_at(start, HEALTH_INTERVAL);
+
+    let mut shutdown = Box::pin(shutdown_signal());
+    let mut dirty = true;
+    let mut last_draw: Option<tokio::time::Instant> = None;
 
     loop {
-        update_textarea_style(&mut textarea, app);
-        terminal.draw(|f| ui::render(f, app, &textarea))?;
+        // Coalesce redraws: a stream chunk or key burst only marks the frame dirty, and the
+        // draw happens at most once per MIN_FRAME.
+        let next_draw = last_draw.map_or_else(tokio::time::Instant::now, |t| t + MIN_FRAME);
+        if dirty && tokio::time::Instant::now() >= next_draw {
+            update_textarea_style(&mut textarea, app);
+            terminal.draw(|f| ui::render(f, app, &textarea))?;
+            last_draw = Some(tokio::time::Instant::now());
+            dirty = false;
+        }
 
         tokio::select! {
             maybe_event = events.next() => {
-                let Some(Ok(event)) = maybe_event else { break };
-                handle_crossterm_event(event, app, &mut textarea, &tx);
+                match maybe_event {
+                    Some(Ok(event)) => handle_crossterm_event(event, app, &mut textarea, &tx),
+                    Some(Err(e)) => return Err(e),
+                    None => return Err(io::Error::other("terminal event stream closed")),
+                }
+                dirty = true;
             }
             maybe_msg = rx.recv() => {
                 let Some(msg) = maybe_msg else { break };
                 handle_app_event(msg, app, &tx);
+                dirty = true;
             }
             _ = health_tick.tick() => {
                 spawn_health_check(app, tx.clone());
             }
+            _ = &mut shutdown => {
+                app.should_quit = true;
+            }
+            _ = tokio::time::sleep_until(next_draw), if dirty => {}
         }
 
         if app.should_quit {
@@ -111,6 +149,29 @@ async fn run_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     }
 
     Ok(())
+}
+
+/// Resolves on SIGTERM / SIGHUP / SIGINT (unix) so the app quits cleanly and the terminal is
+/// restored. Never resolves elsewhere (Ctrl+C arrives as a key event in raw mode).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut hup), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+            _ = int.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await
 }
 
 // ── Event handlers ────────────────────────────────────────────────────────────
@@ -161,6 +222,8 @@ fn handle_crossterm_event(
     if !key_accepted(key.kind, key.code, key.modifiers, &app.input_mode) {
         return;
     }
+    // The user is doing something else: a model list arriving now must not pop a picker over it.
+    app.model_picker_pending = false;
 
     // Global quit
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -176,12 +239,21 @@ fn handle_crossterm_event(
                 // Dismiss the dialog immediately — don't wait for the LLM to finish.
                 app.input_mode = InputMode::Editing;
                 app.pending_confirmation = None;
+                app.confirm_scroll = 0;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 spawn_confirm_tool(app, tx.clone(), false);
                 app.input_mode = InputMode::Editing;
                 app.pending_confirmation = None;
+                app.confirm_scroll = 0;
             }
+            // Long descriptions (bulk ops) scroll; the renderer clamps the offset.
+            KeyCode::Up => app.confirm_scroll = app.confirm_scroll.saturating_sub(1),
+            KeyCode::Down => app.confirm_scroll = app.confirm_scroll.saturating_add(1),
+            KeyCode::PageUp => app.confirm_scroll = app.confirm_scroll.saturating_sub(8),
+            KeyCode::PageDown => app.confirm_scroll = app.confirm_scroll.saturating_add(8),
+            KeyCode::Home => app.confirm_scroll = 0,
+            KeyCode::End => app.confirm_scroll = usize::MAX,
             _ => {}
         },
 
@@ -195,7 +267,10 @@ fn handle_crossterm_event(
                 app.slash_selected = 0;
             }
             KeyCode::Esc if app.is_loading || app.streaming_text.is_some() => {
-                app.cancel_request();
+                if app.cancel_request() {
+                    // Tools may already have changed disk before the abort.
+                    finish_request(app, tx);
+                }
             }
             // Plain Enter submits; Shift/Alt+Enter inserts a newline so the
             // user can compose multi-paragraph prompts.
@@ -282,6 +357,7 @@ fn handle_crossterm_event(
                 }
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Aborts any in-flight request first so its late reply can't restore the old chat.
                 app.clear_conversation();
             }
             // Tab: accept highlighted completion if popup is open, else switch panel.
@@ -355,6 +431,10 @@ fn key_accepted(
     match kind {
         KeyEventKind::Press => true,
         KeyEventKind::Release => false,
+        KeyEventKind::Repeat if *mode == InputMode::Confirming => matches!(
+            code,
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+        ),
         KeyEventKind::Repeat => {
             *mode == InputMode::Editing
                 && match code {
@@ -376,6 +456,9 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
         .split_once(' ')
         .map_or((text, ""), |(c, a)| (c, a.trim()));
 
+    // Running any command ends a pending async model-picker request.
+    app.model_picker_pending = false;
+
     match cmd {
         "/clear" => app.clear_conversation(),
         "/exit" => app.should_quit = true,
@@ -383,10 +466,13 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
             if arg.is_empty() {
                 push_error(app, "Usage: /dir <path>");
             } else {
-                let dir = PathBuf::from(arg);
-                app.set_working_dir(dir.clone());
-                spawn_file_tree_load(dir, tx.clone());
-                spawn_health_check(app, tx.clone());
+                match app.set_working_dir(PathBuf::from(arg)) {
+                    Ok(dir) => {
+                        spawn_file_tree_load(dir, tx.clone());
+                        spawn_health_check(app, tx.clone());
+                    }
+                    Err(e) => push_error(app, &e),
+                }
             }
         }
         "/model" => {
@@ -396,6 +482,7 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
                         open_model_picker(app, openrouter_model_list());
                     }
                     Provider::Ollama => {
+                        app.model_picker_pending = true;
                         spawn_fetch_ollama_models(app, tx.clone());
                     }
                     Provider::Local => {
@@ -404,7 +491,7 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
                 }
             } else {
                 mutate_config(app, |c| c.model = arg.to_string());
-                persist_setting(app, "model", arg);
+                persist_setting(app, storage::model_setting_key(&app.config.provider), arg);
                 push_info(app, &format!("Model set to: {arg}"));
             }
         }
@@ -479,14 +566,7 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
             }
         }
         "/sessions" => {
-            let sessions = app.list_sessions();
-            if sessions.is_empty() {
-                if app.storage.project.is_none() {
-                    push_error(app, "No project open. Use /dir <path> first.");
-                } else {
-                    push_info(app, "No sessions yet for this project.");
-                }
-            } else {
+            if let Some(sessions) = sessions_or_notice(app) {
                 let mut lines = vec!["Recent sessions — use /resume <id> to continue:".to_string()];
                 for s in sessions {
                     lines.push(format!(
@@ -502,14 +582,7 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
         "/resume" => {
             if arg.is_empty() {
                 // No id given — open the interactive picker.
-                let sessions = app.list_sessions();
-                if sessions.is_empty() {
-                    if app.storage.project.is_none() {
-                        push_error(app, "No project open. Use /dir <path> first.");
-                    } else {
-                        push_info(app, "No sessions yet for this project.");
-                    }
-                } else {
+                if let Some(sessions) = sessions_or_notice(app) {
                     app.slash_picker = Some(crate::app::SlashPicker {
                         command: "/resume",
                         items: sessions
@@ -529,23 +602,35 @@ fn dispatch_slash_command(text: &str, app: &mut App, tx: &UnboundedSender<AppEve
                 }
             } else {
                 match arg.parse::<i64>() {
-                    Ok(id) => {
-                        if app.resume_session(id) {
-                            push_info(app, &format!("Session #{id} resumed."));
-                        } else {
-                            push_error(
-                                app,
-                                &format!(
-                                    "Session #{id} not found. Use /sessions to list available sessions."
-                                ),
-                            );
-                        }
-                    }
+                    Ok(id) => match app.resume_session(id) {
+                        Ok(()) => push_info(app, &format!("Session #{id} resumed.")),
+                        Err(e) => push_error(app, &e),
+                    },
                     Err(_) => push_error(app, "Usage: /resume <session-id>"),
                 }
             }
         }
         _ => push_error(app, &format!("Unknown command: {cmd}")),
+    }
+}
+
+/// Recent sessions for the open project, or `None` after pushing why there is nothing to show
+/// (no project, storage error, or no sessions yet).
+fn sessions_or_notice(app: &mut App) -> Option<Vec<storage::SessionSummary>> {
+    match app.list_sessions() {
+        Ok(s) if !s.is_empty() => Some(s),
+        Ok(_) if app.storage.project.is_none() => {
+            push_error(app, "No project open. Use /dir <path> first.");
+            None
+        }
+        Ok(_) => {
+            push_info(app, "No sessions yet for this project.");
+            None
+        }
+        Err(e) => {
+            push_error(app, &format!("Could not read sessions: {e}"));
+            None
+        }
     }
 }
 
@@ -789,6 +874,31 @@ async fn fetch_ollama_models(client: &reqwest::Client, base_url: &str) -> Vec<St
     }
 }
 
+/// Persist the session and surface a failure as a chat warning instead of losing data silently.
+fn save_session_or_warn(app: &mut App) {
+    if let Err(e) = app.save_current_session() {
+        app.chat_messages.push(ChatEntry {
+            role: ChatRole::Warning,
+            content: format!("Session not saved: {e}"),
+        });
+    }
+}
+
+/// Reload the file tree, keeping expansion state. Tools may have changed disk during a request
+/// even when it ended in an error or was cancelled.
+fn refresh_file_tree(app: &mut App, tx: &UnboundedSender<AppEvent>) {
+    if let Some(dir) = app.working_dir.clone() {
+        app.prepare_refresh();
+        spawn_file_tree_load(dir, tx.clone());
+    }
+}
+
+/// Common tail of every request that ended (success, error, or cancel).
+fn finish_request(app: &mut App, tx: &UnboundedSender<AppEvent>) {
+    save_session_or_warn(app);
+    refresh_file_tree(app, tx);
+}
+
 fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEvent>) {
     match event {
         AppEvent::LlmResponse {
@@ -799,18 +909,14 @@ fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEven
             if request_id.is_some_and(|id| !app.is_active_request(id)) {
                 return;
             }
-            // Refresh the file tree after any successful LLM response so newly
-            // created/deleted/renamed files appear without a manual /dir reload.
-            let should_refresh = matches!(outcome, app::LlmOutcome::Complete { .. });
+            // A task panic reports through here while a stream may be mid-flight.
+            app.finalize_stream();
+            let ended = !matches!(outcome, app::LlmOutcome::PendingConfirmation { .. });
             app.current_request = None;
             app.active_request_id = None;
             app.handle_outcome(outcome, conversation);
-            if should_refresh {
-                app.save_current_session();
-                if let Some(dir) = app.working_dir.clone() {
-                    app.prepare_refresh();
-                    spawn_file_tree_load(dir, tx.clone());
-                }
+            if ended {
+                finish_request(app, tx);
             }
         }
         AppEvent::StreamChunk { request_id, chunk } => {
@@ -828,16 +934,12 @@ fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEven
                 return;
             }
             app.finalize_stream();
-            let should_refresh = matches!(outcome, app::LlmOutcome::Complete { .. });
+            let ended = !matches!(outcome, app::LlmOutcome::PendingConfirmation { .. });
             app.current_request = None;
             app.active_request_id = None;
             app.handle_outcome(outcome, conversation);
-            if should_refresh {
-                app.save_current_session();
-                if let Some(dir) = app.working_dir.clone() {
-                    app.prepare_refresh();
-                    spawn_file_tree_load(dir, tx.clone());
-                }
+            if ended {
+                finish_request(app, tx);
             }
         }
         AppEvent::IntermediateAssistant {
@@ -905,6 +1007,10 @@ fn handle_app_event(event: AppEvent, app: &mut App, tx: &UnboundedSender<AppEven
             app.restore_pending_scroll();
         }
         AppEvent::ModelsLoaded(models) => {
+            // Ignore a late reply once the user has moved on (typed, ran another command).
+            if !std::mem::take(&mut app.model_picker_pending) {
+                return;
+            }
             if models.is_empty() {
                 app.chat_messages.push(app::ChatEntry {
                     role: app::ChatRole::Error,
@@ -994,8 +1100,56 @@ fn check_context(
     true
 }
 
+/// Aborts the wrapped task when dropped, so aborting the outer request handle also stops the
+/// inner task it supervises.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(s) => *s,
+        Err(p) => p
+            .downcast::<&'static str>()
+            .map_or_else(|_| "unknown panic".to_string(), |s| (*s).to_string()),
+    }
+}
+
+/// Run a request task under a supervisor. If it panics, report an error for `request_id`
+/// (restoring `fallback` as the conversation) instead of leaving the UI stuck in "loading".
+/// The returned handle is the one stored in `App::current_request`; aborting it aborts the task.
+fn spawn_request(
+    tx: UnboundedSender<AppEvent>,
+    request_id: app::RequestId,
+    fallback: Vec<crate::llm::types::Message>,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut inner = AbortOnDrop(tokio::spawn(fut));
+        if let Err(e) = (&mut inner.0).await
+            && e.is_panic()
+        {
+            let _ = tx.send(AppEvent::LlmResponse {
+                request_id: Some(request_id),
+                outcome: app::LlmOutcome::Error {
+                    message: format!(
+                        "Internal error: the request task panicked ({})",
+                        panic_message(e.into_panic())
+                    ),
+                },
+                conversation: fallback,
+            });
+        }
+    })
+}
+
 fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String) {
     app.abort_in_flight();
+    app.is_loading = true;
 
     let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
@@ -1007,9 +1161,10 @@ fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String
     }
 
     let request_id = app.allocate_request_id();
-    if config.streaming_enabled {
-        let tx2 = tx.clone();
-        let h = tokio::spawn(async move {
+    let fallback = conversation.clone();
+    let tx2 = tx.clone();
+    let h = if config.streaming_enabled {
+        spawn_request(tx, request_id, fallback, async move {
             let (outcome, conv) = app::send_message_streaming(
                 runtime,
                 config,
@@ -1025,20 +1180,19 @@ fn spawn_send_message(app: &mut App, tx: UnboundedSender<AppEvent>, text: String
                 outcome,
                 conversation: conv,
             });
-        });
-        app.current_request = Some(h);
+        })
     } else {
-        let h = tokio::spawn(async move {
+        spawn_request(tx, request_id, fallback, async move {
             let (outcome, conv) =
                 app::send_message(runtime, config, conversation, working_dir, text).await;
-            let _ = tx.send(AppEvent::LlmResponse {
+            let _ = tx2.send(AppEvent::LlmResponse {
                 request_id: Some(request_id),
                 outcome,
                 conversation: conv,
             });
-        });
-        app.current_request = Some(h);
-    }
+        })
+    };
+    app.current_request = Some(h);
 }
 
 fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bool) {
@@ -1047,6 +1201,9 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
     };
 
     app.abort_in_flight();
+    if approved {
+        app.is_loading = true;
+    }
 
     let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
@@ -1059,9 +1216,10 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
     }
 
     let request_id = app.allocate_request_id();
-    if config.streaming_enabled {
-        let tx2 = tx.clone();
-        let h = tokio::spawn(async move {
+    let fallback = conversation.clone();
+    let tx2 = tx.clone();
+    let h = if config.streaming_enabled {
+        spawn_request(tx, request_id, fallback, async move {
             let (outcome, conv) = app::confirm_tool_streaming(
                 runtime,
                 config,
@@ -1078,10 +1236,9 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
                 outcome,
                 conversation: conv,
             });
-        });
-        app.current_request = Some(h);
+        })
     } else {
-        let h = tokio::spawn(async move {
+        spawn_request(tx, request_id, fallback, async move {
             let (outcome, conv) = app::confirm_tool(
                 runtime,
                 config,
@@ -1091,14 +1248,14 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
                 approved,
             )
             .await;
-            let _ = tx.send(AppEvent::LlmResponse {
+            let _ = tx2.send(AppEvent::LlmResponse {
                 request_id: Some(request_id),
                 outcome,
                 conversation: conv,
             });
-        });
-        app.current_request = Some(h);
-    }
+        })
+    };
+    app.current_request = Some(h);
 }
 
 // ── Textarea helpers ──────────────────────────────────────────────────────────

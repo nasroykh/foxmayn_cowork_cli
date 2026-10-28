@@ -19,11 +19,12 @@ use llm::runtime::LlmRuntime;
 #[derive(Parser)]
 #[command(
     name = "foxmayn-cowork",
+    version,
     about = "Local AI assistant for file management"
 )]
 struct Cli {
     /// Working directory to open at startup
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     dir: Option<PathBuf>,
 
     /// LLM provider to use
@@ -48,14 +49,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Send one message and print raw request/response + tool results. No TUI.
+    /// Send one message and print raw request/response + tool results. No TUI. Tools that need
+    /// confirmation are never executed. Uses the top-level `--dir` (default: current directory).
+    #[command(hide = true)]
     Probe {
         /// Message to send (default: "list all .md files")
         #[arg(default_value = "list all .md files")]
         message: String,
-        /// Working directory for tool execution
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
         /// Use the streaming chat path (chat_stream + assembler) instead of one-shot chat.
         #[arg(long, action = clap::ArgAction::SetTrue)]
         stream: bool,
@@ -64,18 +64,26 @@ enum Commands {
     Config,
 }
 
+/// Load the global config file (`~/.config/foxmayn-cowork/.env`). Variables already present in
+/// the real environment win. The working directory's `.env` is deliberately never read: a
+/// repository you open must not be able to change provider, base URL or confirmation policy.
+/// (Developers get a project `.env` through the Justfile's `set dotenv-load`.)
+fn load_global_env() {
+    if let Some(p) = setup::config_path()
+        && p.is_file()
+    {
+        let _ = dotenvy::from_path(&p);
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // CWD/.env takes precedence (dev workflow with `just run`).
-    let loaded_from_cwd = dotenvy::dotenv().is_ok();
-
     let cli = Cli::parse();
+
+    load_global_env();
 
     // `foxmayn-cowork config`: load existing config for defaults, run wizard, exit.
     if matches!(cli.command, Some(Commands::Config)) {
-        if !loaded_from_cwd && let Some(p) = setup::config_path() {
-            dotenvy::from_path(&p).ok();
-        }
         let current = Config::from_env();
         if let Err(e) = setup::run_wizard(Some(&current)) {
             eprintln!("Config error: {e}");
@@ -84,49 +92,49 @@ async fn main() {
         return;
     }
 
-    // First-time setup: run wizard when no config file exists and stdin is a TTY.
-    if !loaded_from_cwd
-        && setup::needs_init()
-        && let Err(e) = setup::run_wizard(None)
-    {
-        eprintln!("Setup error: {e}");
-        std::process::exit(1);
+    // First-time setup: nothing configured anywhere and stdin is a TTY.
+    if setup::needs_init() {
+        if let Err(e) = setup::run_wizard(None) {
+            eprintln!("Setup error: {e}");
+            std::process::exit(1);
+        }
+        load_global_env();
     }
 
-    // Load the config-dir .env (written by wizard or pre-existing).
-    if !loaded_from_cwd && let Some(p) = setup::config_path() {
-        dotenvy::from_path(&p).ok();
-    }
-
-    let base_config = Config::from_env().with_overrides(
-        cli.provider,
-        cli.model,
-        cli.streaming,
-        cli.skip_confirmations,
-    );
-
-    if let Some(Commands::Probe {
-        message,
-        dir,
-        stream,
-    }) = cli.command
-    {
-        probe(base_config, message, dir, stream).await;
+    if let Some(Commands::Probe { message, stream }) = cli.command {
+        let config = Config::from_env().with_overrides(
+            cli.provider,
+            cli.model,
+            cli.streaming,
+            cli.skip_confirmations,
+        );
+        let dir = cli.dir.unwrap_or_else(|| PathBuf::from("."));
+        if let Err(e) = probe(config, message, dir, stream).await {
+            eprintln!("probe failed: {e}");
+            std::process::exit(1);
+        }
         return;
     }
 
-    // Open persistent storage and layer saved settings on top of env/CLI config.
-    let storage = storage::Storage::open();
-    let config = storage::apply_saved_settings(base_config, &storage);
+    // Layering, lowest to highest: env, saved `/…` settings, explicit CLI flags.
+    let mut storage = storage::Storage::open();
+    let mut startup_warnings: Vec<String> = Vec::new();
+    startup_warnings.extend(storage.init_warning.take());
+    let env_config = Config::from_env().with_overrides(cli.provider, None, None, false);
+    let (saved_config, saved_warning) = storage::apply_saved_settings(env_config, &storage);
+    startup_warnings.extend(saved_warning);
+    let config =
+        saved_config.with_overrides(None, cli.model, cli.streaming, cli.skip_confirmations);
 
     if let Err(msg) = preflight(&config) {
         eprintln!("{msg}");
         std::process::exit(1);
     }
     if config.skip_confirmations {
-        eprintln!(
-            "WARNING: destructive-operation confirmations are disabled. The AI can edit, delete, rename, and bulk-operate without prompting."
-        );
+        let warning = "Destructive-operation confirmations are disabled. The AI can edit, delete, \
+                       rename, and bulk-operate without prompting.";
+        eprintln!("WARNING: {warning}");
+        startup_warnings.push(warning.to_string());
     }
 
     let llm_runtime = match LlmRuntime::build(&config).await {
@@ -161,20 +169,32 @@ async fn main() {
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: could not verify tool-calling support for Ollama model '{}': {e}\n\
-                     Proceeding anyway — if the model misbehaves after tool calls, switch to a\n\
-                     tool-capable model (e.g. qwen2.5:7b, llama3.1:8b).",
+                let warning = format!(
+                    "Could not verify tool-calling support for Ollama model '{}': {e}. \
+                     If the model misbehaves after tool calls, switch to a tool-capable \
+                     model (e.g. qwen2.5:7b, llama3.1:8b).",
                     config.model
                 );
+                eprintln!("Warning: {warning}");
+                startup_warnings.push(warning);
             }
         }
     }
 
     let mut app = App::new(Arc::new(config), llm_runtime, storage);
 
-    if let Some(dir) = cli.dir {
-        app.set_working_dir(dir);
+    if let Some(dir) = cli.dir
+        && let Err(e) = app.set_working_dir(dir)
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+    // stderr is hidden by the alternate screen, so repeat startup warnings in the chat.
+    for warning in startup_warnings {
+        app.chat_messages.push(app::ChatEntry {
+            role: app::ChatRole::Warning,
+            content: warning,
+        });
     }
 
     if let Err(e) = tui::run(app).await {
@@ -211,11 +231,13 @@ fn preflight(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-async fn probe(config: Config, message: String, dir: PathBuf, stream: bool) {
-    use llm::tools::{dispatch_tool_call, execute_tool, tool_definitions};
+async fn probe(config: Config, message: String, dir: PathBuf, stream: bool) -> Result<(), String> {
+    use llm::tools::{dispatch_tool_call, tool_definitions};
     use llm::types::{ChatRequest, Message};
 
-    let base_path = dir.canonicalize().unwrap_or(dir.clone());
+    let base_path = dir
+        .canonicalize()
+        .map_err(|e| format!("cannot open directory '{}': {e}", dir.display()))?;
 
     println!("=== PROBE ===");
     println!("provider : {:?}", config.provider);
@@ -231,13 +253,9 @@ async fn probe(config: Config, message: String, dir: PathBuf, stream: bool) {
         ..config.clone()
     };
 
-    let runtime = match LlmRuntime::build(&ollama_config).await {
-        Ok(r) => r,
-        Err(e) => {
-            println!("ERROR: failed to build LLM runtime: {e}");
-            return;
-        }
-    };
+    let runtime = LlmRuntime::build(&ollama_config)
+        .await
+        .map_err(|e| format!("failed to build LLM runtime: {e}"))?;
 
     let mut messages: Vec<Message> = vec![Message::user(&message)];
 
@@ -252,25 +270,21 @@ async fn probe(config: Config, message: String, dir: PathBuf, stream: bool) {
         };
 
         println!("--- REQUEST (round {round}) ---");
-        println!("{}", serde_json::to_string_pretty(&request).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&request)
+                .map_err(|e| format!("could not serialize request: {e}"))?
+        );
         println!();
 
         let assistant_msg = if stream {
-            match probe_stream_one(&runtime, &request, &ollama_config).await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    println!("ERROR: {e}");
-                    break;
-                }
-            }
+            probe_stream_one(&runtime, &request, &ollama_config)
+                .await
+                .map_err(|e| e.to_string())?
         } else {
-            match llm::chat(&runtime, &request, &ollama_config).await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    println!("ERROR: {e}");
-                    break;
-                }
-            }
+            llm::chat(&runtime, &request, &ollama_config)
+                .await
+                .map_err(|e| e.to_string())?
         };
 
         // Pretty-print the returned message as JSON for inspection
@@ -303,54 +317,37 @@ async fn probe(config: Config, message: String, dir: PathBuf, stream: bool) {
             break;
         }
 
-        // Execute tools
+        // Run read-only tools; tools that need confirmation are described, never executed.
         for tc in assistant_msg.tool_calls.unwrap_or_default() {
             println!("--- TOOL CALL: {} ---", tc.function.name);
             println!("args: {}", tc.function.arguments);
 
-            match dispatch_tool_call(&tc.function, &base_path).await {
+            let result_str = match dispatch_tool_call(&tc.function, &base_path).await {
                 Ok(r) if r.requires_confirmation => {
-                    println!("result: <needs confirmation — executing unconditionally in probe>");
-                    match execute_tool(&tc.function, &base_path).await {
-                        Ok(output) => {
-                            println!("executed: {output}");
-                            messages.push(Message::tool_result(
-                                &tc.function.name,
-                                &output,
-                                tc.id.clone(),
-                            ));
-                        }
-                        Err(e) => {
-                            println!("tool error: {e}");
-                            messages.push(Message::tool_result(
-                                &tc.function.name,
-                                format!("Error: {e}"),
-                                tc.id.clone(),
-                            ));
-                        }
-                    }
+                    println!("{}", r.description);
+                    println!("not executed (requires confirmation)");
+                    "Not executed: this operation requires user confirmation, which is unavailable in probe."
+                        .to_string()
                 }
                 Ok(r) => {
-                    let result_str = r.result.as_deref().unwrap_or("");
+                    let result_str = r.result.unwrap_or_default();
                     println!("result: {result_str}");
-                    messages.push(Message::tool_result(
-                        &tc.function.name,
-                        result_str,
-                        tc.id.clone(),
-                    ));
+                    result_str
                 }
                 Err(e) => {
                     println!("tool error: {e}");
-                    messages.push(Message::tool_result(
-                        &tc.function.name,
-                        format!("Error: {e}"),
-                        tc.id.clone(),
-                    ));
+                    format!("Error: {e}")
                 }
-            }
+            };
+            messages.push(Message::tool_result(
+                &tc.function.name,
+                result_str,
+                tc.id.clone(),
+            ));
             println!();
         }
     }
+    Ok(())
 }
 
 /// Streaming probe path: drive `llm::chat_stream`, print chunks live, and assemble the same
