@@ -116,6 +116,10 @@ pub struct PendingToolCall {
     pub tool_call_id: Option<String>,
     #[expect(dead_code)]
     pub user_message: String,
+    /// Calls of the same assistant message that follow this one and have not run yet.
+    pub remaining: Vec<crate::llm::types::ToolCall>,
+    /// Non-streaming `[tool]` summary lines collected so far in this turn.
+    pub summaries: Vec<String>,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -430,6 +434,8 @@ impl App {
                 arguments,
                 tool_call_id,
                 user_message,
+                remaining,
+                summaries,
             } => {
                 self.pending_confirmation = Some(PendingToolCall {
                     description,
@@ -437,6 +443,8 @@ impl App {
                     arguments,
                     tool_call_id,
                     user_message,
+                    remaining,
+                    summaries,
                 });
                 self.input_mode = InputMode::Confirming;
             }

@@ -2,7 +2,9 @@ use futures::StreamExt;
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::types::{ChatRequest, FunctionCall, Message, StreamChunk, ToolCall};
+use super::types::{
+    ChatRequest, FunctionCall, Message, StreamChunk, ToolCall, parse_tool_arguments,
+};
 use crate::error::AppError;
 
 #[derive(Debug, Deserialize)]
@@ -237,13 +239,12 @@ fn normalize(msg: OpenRouterMessage) -> Result<Message, AppError> {
             calls
                 .into_iter()
                 .map(|tc| {
-                    let arguments: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                        .map_err(|e| {
-                            AppError::LlmError(format!(
-                                "Failed to parse tool arguments for '{}': {e}",
-                                tc.function.name
-                            ))
-                        })?;
+                    let arguments = parse_tool_arguments(&tc.function.arguments).map_err(|e| {
+                        AppError::LlmError(format!(
+                            "Failed to parse tool arguments for '{}': {e}",
+                            tc.function.name
+                        ))
+                    })?;
                     Ok(ToolCall {
                         id: Some(tc.id),
                         r#type: "function".to_string(),

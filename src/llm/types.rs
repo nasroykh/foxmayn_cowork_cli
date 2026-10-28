@@ -247,6 +247,15 @@ pub struct FunctionCall {
     pub arguments: serde_json::Value,
 }
 
+/// Parse a provider-supplied tool-call arguments string. Empty or whitespace-only input
+/// (zero-argument calls from some providers) is treated as `{}`.
+pub fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(raw)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub r#type: String,
@@ -299,6 +308,17 @@ mod wire_format_tests {
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["effort"], json!("minimal"));
+    }
+
+    #[test]
+    fn empty_tool_arguments_become_empty_object() {
+        assert_eq!(parse_tool_arguments("").unwrap(), json!({}));
+        assert_eq!(parse_tool_arguments("  \n").unwrap(), json!({}));
+        assert_eq!(
+            parse_tool_arguments(r#"{"path":"a"}"#).unwrap(),
+            json!({"path": "a"})
+        );
+        assert!(parse_tool_arguments("{").is_err());
     }
 
     #[test]
