@@ -87,12 +87,32 @@ async fn resolve_model_path(config: &Config) -> Result<PathBuf, AppError> {
     let repo = config.local_model_repo.clone();
     let file = config.local_model_file.clone();
 
-    let api = hf_hub::api::tokio::Api::new()
-        .map_err(|e| AppError::LlmError(format!("HuggingFace API: {e}")))?;
+    let (owner, name) = repo.split_once('/').ok_or_else(|| {
+        AppError::LlmError(format!(
+            "LOCAL_MODEL_REPO must be in `owner/name` form, got: {repo}"
+        ))
+    })?;
 
-    let path = api
-        .model(repo)
-        .get(&file)
+    let client =
+        hf_hub::HFClient::new().map_err(|e| AppError::LlmError(format!("HuggingFace API: {e}")))?;
+    let model_repo = client.model(owner, name);
+
+    // Cache-first, no network: preserves the offline reuse of a previously
+    // downloaded model (hf-hub 0.3 `Api::get` behaved the same way).
+    if let Ok(cached) = model_repo
+        .download_file()
+        .filename(file.as_str())
+        .local_files_only(true)
+        .send()
+        .await
+    {
+        return Ok(cached);
+    }
+
+    let path = model_repo
+        .download_file()
+        .filename(file.as_str())
+        .send()
         .await
         .map_err(|e| AppError::LlmError(format!("Model download: {e}")))?;
 

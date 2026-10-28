@@ -15,8 +15,8 @@ use crossterm::{
 };
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tui_textarea::TextArea;
 
 use crate::app::{
     self, App, AppEvent, ChatEntry, ChatRole, InputMode, Panel, SlashPicker, SlashPickerItem,
@@ -69,7 +69,7 @@ pub async fn run(mut app: App) -> io::Result<()> {
     result
 }
 
-async fn run_loop<B: ratatui::backend::Backend>(
+async fn run_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> io::Result<()> {

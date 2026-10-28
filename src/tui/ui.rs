@@ -5,7 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use super::commands;
 use super::widgets;
