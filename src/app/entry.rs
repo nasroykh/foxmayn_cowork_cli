@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::llm::runtime::LlmRuntime;
-use crate::llm::types::Message;
+use crate::llm::types::{Message, repair_tool_history};
 
 use super::agentic::{resolve_pending, run_agentic_loop};
 use super::events::{AppEvent, LlmOutcome, RequestId};
@@ -16,10 +16,12 @@ use super::system_prompt::{system_prompt, working_dir_summary};
 pub async fn send_message(
     runtime: LlmRuntime,
     config: Arc<Config>,
-    conversation: Vec<Message>,
+    mut conversation: Vec<Message>,
     working_dir: Option<PathBuf>,
     user_message: String,
 ) -> (LlmOutcome, Vec<Message>) {
+    // A cancelled or failed earlier turn may have left tool calls unanswered.
+    repair_tool_history(&mut conversation);
     if working_dir.is_none() {
         return (
             LlmOutcome::Error {
@@ -74,12 +76,14 @@ pub async fn confirm_tool(
 pub async fn send_message_streaming(
     runtime: LlmRuntime,
     config: Arc<Config>,
-    conversation: Vec<Message>,
+    mut conversation: Vec<Message>,
     working_dir: Option<PathBuf>,
     user_message: String,
     request_id: RequestId,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> (LlmOutcome, Vec<Message>) {
+    // A cancelled or failed earlier turn may have left tool calls unanswered.
+    repair_tool_history(&mut conversation);
     if working_dir.is_none() {
         return (
             LlmOutcome::Error {

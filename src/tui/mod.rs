@@ -1206,19 +1206,17 @@ fn spawn_confirm_tool(app: &mut App, tx: UnboundedSender<AppEvent>, approved: bo
     };
 
     app.abort_in_flight();
-    if approved {
-        app.is_loading = true;
-    }
+    // Also while declining: a fast Enter must not abort the decline task and send the open
+    // snapshot as a new message.
+    app.is_loading = true;
 
     let runtime = app.llm_runtime.clone();
     let config = app.config.clone();
     let working_dir = app.working_dir.clone();
     let conversation = app.conversation.clone();
 
-    // Only check context when the user approves (cancellation never hits the LLM).
-    if approved && !check_context(&config, &conversation, &tx) {
-        return;
-    }
+    // No context-size check here: the user already decided, and bailing out would leave the
+    // pending snapshot unanswered and the approved tool unrun.
 
     let request_id = app.allocate_request_id();
     let fallback = conversation.clone();

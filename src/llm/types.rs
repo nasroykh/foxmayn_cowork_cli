@@ -222,6 +222,64 @@ impl Message {
     }
 }
 
+/// Content of the synthetic tool message inserted for a tool call that has no recorded result.
+pub const MISSING_TOOL_RESULT: &str = "No result recorded: the request was interrupted. \
+The operation may or may not have run; check the files before retrying.";
+
+/// Restore the invariant every provider requires: each assistant `tool_calls` id is answered by
+/// exactly one `tool` message directly after it (before the next non-tool message), and no
+/// `tool` message exists without a matching call.
+///
+/// Missing results are inserted after the existing tool results of that turn, in call order.
+/// Orphan and duplicate tool messages are dropped. A call without an id is matched by a tool
+/// message that also has no id. Valid histories are left unchanged.
+///
+/// Must not be applied while a confirmation is pending: that snapshot is intentionally open.
+pub fn repair_tool_history(messages: &mut Vec<Message>) {
+    let old = std::mem::take(messages);
+    let mut out: Vec<Message> = Vec::with_capacity(old.len());
+    let mut iter = old.into_iter().peekable();
+
+    while let Some(msg) = iter.next() {
+        if msg.role == "tool" {
+            // Not consumed by an assistant turn below, so it answers nothing.
+            continue;
+        }
+        let calls: Vec<ToolCall> = if msg.role == "assistant" {
+            msg.tool_calls.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        out.push(msg);
+        if calls.is_empty() {
+            continue;
+        }
+
+        let mut answered = vec![false; calls.len()];
+        while iter.peek().is_some_and(|m| m.role == "tool") {
+            let tool = iter.next().expect("peeked");
+            let slot = calls
+                .iter()
+                .enumerate()
+                .position(|(i, c)| !answered[i] && c.id == tool.tool_call_id);
+            if let Some(i) = slot {
+                answered[i] = true;
+                out.push(tool);
+            }
+        }
+        for (i, call) in calls.iter().enumerate() {
+            if !answered[i] {
+                out.push(Message::tool_result(
+                    call.function.name.clone(),
+                    MISSING_TOOL_RESULT,
+                    call.id.clone(),
+                ));
+            }
+        }
+    }
+    *messages = out;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,5 +387,156 @@ mod wire_format_tests {
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["summary"], json!("auto"));
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(id: Option<&str>, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.map(Into::into),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: json!({}),
+            },
+        }
+    }
+
+    fn assistant(calls: Vec<ToolCall>) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(calls),
+            name: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn tool(id: Option<&str>, content: &str) -> Message {
+        Message::tool_result("t", content, id.map(Into::into))
+    }
+
+    fn shape(m: &[Message]) -> Vec<(String, Option<String>)> {
+        m.iter()
+            .map(|m| (m.role.clone(), m.tool_call_id.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn valid_history_unchanged() {
+        let mut m = vec![
+            Message::user("hi"),
+            assistant(vec![call(Some("a"), "x"), call(Some("b"), "y")]),
+            tool(Some("b"), "rb"),
+            tool(Some("a"), "ra"),
+            Message::user("next"),
+        ];
+        let before = serde_json::to_string(&m).unwrap();
+        repair_tool_history(&mut m);
+        assert_eq!(serde_json::to_string(&m).unwrap(), before);
+    }
+
+    #[test]
+    fn missing_results_inserted_after_existing_in_call_order() {
+        let mut m = vec![
+            Message::user("hi"),
+            assistant(vec![
+                call(Some("a"), "x"),
+                call(Some("b"), "y"),
+                call(Some("c"), "z"),
+            ]),
+            tool(Some("b"), "rb"),
+        ];
+        repair_tool_history(&mut m);
+        let ids: Vec<_> = shape(&m).into_iter().skip(2).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("tool".into(), Some("b".into())),
+                ("tool".into(), Some("a".into())),
+                ("tool".into(), Some("c".into())),
+            ]
+        );
+        assert_eq!(m[3].content, MISSING_TOOL_RESULT);
+        assert_eq!(m[3].name.as_deref(), Some("x"));
+        assert_eq!(m[2].content, "rb");
+    }
+
+    #[test]
+    fn missing_results_inserted_before_following_user_message() {
+        let mut m = vec![
+            assistant(vec![call(Some("a"), "x")]),
+            Message::user("again"),
+        ];
+        repair_tool_history(&mut m);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1].role, "tool");
+        assert_eq!(m[2].role, "user");
+    }
+
+    #[test]
+    fn orphan_and_duplicate_tool_messages_dropped() {
+        let mut m = vec![
+            tool(Some("z"), "leading orphan"),
+            Message::user("hi"),
+            assistant(vec![call(Some("a"), "x")]),
+            tool(Some("a"), "first"),
+            tool(Some("a"), "dup"),
+            tool(Some("nope"), "orphan"),
+            Message::user("u"),
+            tool(Some("a"), "after user"),
+        ];
+        repair_tool_history(&mut m);
+        assert_eq!(
+            shape(&m),
+            vec![
+                ("user".into(), None),
+                ("assistant".into(), None),
+                ("tool".into(), Some("a".into())),
+                ("user".into(), None),
+            ]
+        );
+        assert_eq!(m[2].content, "first");
+    }
+
+    #[test]
+    fn multiple_turns_repaired_independently() {
+        let mut m = vec![
+            Message::user("1"),
+            assistant(vec![call(Some("a"), "x")]),
+            Message::user("2"),
+            assistant(vec![call(Some("b"), "y"), call(Some("c"), "z")]),
+            tool(Some("c"), "rc"),
+        ];
+        repair_tool_history(&mut m);
+        assert_eq!(
+            shape(&m),
+            vec![
+                ("user".into(), None),
+                ("assistant".into(), None),
+                ("tool".into(), Some("a".into())),
+                ("user".into(), None),
+                ("assistant".into(), None),
+                ("tool".into(), Some("c".into())),
+                ("tool".into(), Some("b".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn calls_without_ids_match_idless_results() {
+        let mut m = vec![
+            assistant(vec![call(None, "x"), call(None, "y")]),
+            tool(None, "r"),
+        ];
+        repair_tool_history(&mut m);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1].content, "r");
+        assert_eq!(m[2].content, MISSING_TOOL_RESULT);
+        assert_eq!(m[2].tool_call_id, None);
     }
 }

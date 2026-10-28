@@ -9,7 +9,7 @@ use crate::config::{Config, ThinkingDisplay};
 use crate::error::AppError;
 use crate::fs::FileEntry;
 use crate::llm::runtime::LlmRuntime;
-use crate::llm::types::StreamChunk;
+use crate::llm::types::{StreamChunk, repair_tool_history};
 use crate::storage::Storage;
 
 use super::events::{LlmOutcome, RequestId};
@@ -652,6 +652,11 @@ impl App {
         if self.storage.project.is_none() || self.conversation.is_empty() {
             return Ok(());
         }
+        // A live confirmation keeps its open snapshot; any other end (cancel, error, panic)
+        // must not persist unanswered tool calls.
+        if self.pending_confirmation.is_none() {
+            repair_tool_history(&mut self.conversation);
+        }
         let conv_json = serde_json::to_string(&self.conversation).map_err(|e| e.to_string())?;
         let chat_json = serde_json::to_string(&self.chat_messages).map_err(|e| e.to_string())?;
         let Some(project) = self.storage.project.as_ref() else {
@@ -696,8 +701,9 @@ impl App {
             .ok_or_else(|| {
                 format!("Session #{id} not found. Use /sessions to list available sessions.")
             })?;
-        let conv = serde_json::from_str(&conv_json)
+        let mut conv: Vec<crate::llm::types::Message> = serde_json::from_str(&conv_json)
             .map_err(|e| format!("Session #{id} is corrupt (conversation): {e}"))?;
+        repair_tool_history(&mut conv);
         let msgs = serde_json::from_str::<Vec<ChatEntry>>(&chat_json)
             .map_err(|e| format!("Session #{id} is corrupt (chat log): {e}"))?;
         self.abort_current_request();
