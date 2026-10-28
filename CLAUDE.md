@@ -24,7 +24,7 @@ just run-model dir=. model=qwen3:0.6b  # model override
 just env            # copy .env.example → .env if missing (the Justfile has `set dotenv-load`, so `just run …` loads it)
 ```
 
-Run a single test module, e.g. `cargo test llm::types`. About 104 unit tests live in `#[cfg(test)]` modules across `src/` (types, fs, storage, setup, config, tools, agentic, retry, widgets, and more). `foxmayn-cowork --version` prints the version.
+Run a single test module, e.g. `cargo test llm::types`. About 115 unit tests live in `#[cfg(test)]` modules across `src/` (types, fs, storage, setup, config, tools, agentic, retry, widgets, and more). `foxmayn-cowork --version` prints the version.
 
 ### Probe subcommand
 
@@ -64,7 +64,7 @@ All async work is fire-and-forget (`tokio::spawn`). Results come back through an
   - `agentic.rs` — `run_agentic_loop` (unified streaming + non-streaming; drives LLM ↔ tool loop up to `MAX_TOOL_ROUNDS`), `apply_confirmation_policy`, `format_tool_summary`
   - `entry.rs` — four public entry points: `send_message`, `send_message_streaming`, `confirm_tool`, `confirm_tool_streaming`
   - `system_prompt.rs` — `system_prompt`, `working_dir_summary`
-- `src/tui/mod.rs` — terminal setup/teardown, `run_loop` event multiplexer (`tokio::select!` over crossterm events, mpsc channel, and a 10-second health-check tick).
+- `src/tui/mod.rs` — terminal setup/teardown, `run_loop` event multiplexer (`tokio::select!` over crossterm events, mpsc channel, and a 60-second health-check tick).
 - `src/tui/ui.rs` + `src/tui/widgets/` — ratatui rendering (chat panel, file tree, scrollable confirmation dialog). `widgets/wrap.rs` does exact row wrapping for the chat panel (cached rendered history, clamped scroll). `src/tui/commands.rs` holds slash-command definitions.
 - `src/llm/tools/` — tools module (split from monolithic `tools.rs`):
   - `schema.rs` — `tool_definitions()` (JSON schema for all 16 tools sent to the LLM)
