@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OLLAMA_THINK` is no longer sent by default. If set and the model cannot think, it is dropped with a warning.
 - A saved `/model` is stored per provider and no longer overrides an explicit `--model`.
 - Per-project storage key is now a readable path tail plus a hash of the canonical path.
+- Per-project session databases moved to the new collision-free key, and sessions saved by 0.x are not migrated: `/sessions` does not list them. The old files stay on disk in the `projects/` folder under the data directory (`~/.local/share/foxmayn-cowork/` on Linux) and can be deleted.
 - HTTP: 15 s connect timeout, 300 s idle read timeout, up to 2 retries on 429/502/503/504 honoring `Retry-After`.
 - Upgraded ratatui 0.30, crossterm 0.29, ratatui-textarea (replaces tui-textarea), reqwest 0.13, rusqlite 0.41, pdf-extract 0.12, hf-hub 1.0, dirs 7.
 - Release workflow is gated on checks and pins actions by SHA.
