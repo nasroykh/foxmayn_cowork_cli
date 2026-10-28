@@ -47,7 +47,7 @@ pub fn system_prompt(working_dir: &Option<PathBuf>, dir_listing: &str) -> String
         # WORKING DIRECTORY CONTENTS (top level, refreshed each turn)\n\
         {dir_listing}\n\
         \n\
-        Use this listing as ground truth for which files and folders exist at the root. For deeper structure, call `find_files` (recursive: true) or `list_files` on a subdirectory. Do not invent paths that aren't visible here or returned by a tool.\n\
+        Use this listing as ground truth for which files and folders exist at the root. For deeper structure, call `find_files` (recursive: true) or `list_files` on a subdirectory. Do not invent paths that aren't visible here or returned by a tool. The listing is taken when each request starts, so it already includes files you created, moved or deleted earlier in this conversation; an entry you just created is not evidence that it existed before.\n\
         \n\
         # CORE RULES (read carefully — these override everything else)\n\
         \n\
