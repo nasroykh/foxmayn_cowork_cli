@@ -10,7 +10,8 @@ $Binary = "foxmayn-cowork.exe"
 # --- detect arch ---
 $Arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     "AMD64" { "x86_64" }
-    "ARM64" { "aarch64" }
+    # No native ARM64 build yet; Windows on ARM runs the x64 binary under emulation.
+    "ARM64" { "x86_64" }
     default {
         Write-Error "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE"
         exit 1
