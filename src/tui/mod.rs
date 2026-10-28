@@ -8,7 +8,7 @@ use chrono::{Local, TimeZone, Utc};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -139,6 +139,8 @@ fn handle_crossterm_event(
         Event::Paste(text) => {
             // Paste only makes sense into the chat input; ignore otherwise.
             if app.input_mode == InputMode::Editing && app.focused_panel == Panel::Chat {
+                // Normalise CRLF / lone CR so stray `\r` never reaches the input.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 let mut first = true;
                 for line in text.split('\n') {
                     if !first {
@@ -147,6 +149,7 @@ fn handle_crossterm_event(
                     textarea.insert_str(line);
                     first = false;
                 }
+                app.update_slash_completions(&textarea.lines().join("\n"));
             }
             return;
         }
@@ -155,6 +158,9 @@ fn handle_crossterm_event(
     }
 
     let Event::Key(key) = event else { return };
+    if !key_accepted(key.kind, key.code, key.modifiers, &app.input_mode) {
+        return;
+    }
 
     // Global quit
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -216,35 +222,31 @@ fn handle_crossterm_event(
                     }
                     return;
                 }
-                // If the completions popup is open, Enter accepts the highlighted entry.
-                // Picker-capable commands with no arg open the picker instead of completing.
-                // Other arg commands complete into the textarea; arg-less commands execute.
-                if !app.slash_completions.is_empty() && app.focused_panel == Panel::Chat {
-                    if let Some(&cmd_idx) = app.slash_completions.get(app.slash_selected) {
-                        let cmd = &commands::COMMANDS[cmd_idx];
-                        if cmd.has_picker {
-                            // Open the picker (dispatch will populate slash_picker).
-                            let name = cmd.name.to_string();
+                // If the completions popup is open, Enter accepts the highlighted entry only
+                // for a partial command word; typed args / full names fall through to submit.
+                if !app.slash_completions.is_empty()
+                    && app.focused_panel == Panel::Chat
+                    && let Some(&cmd_idx) = app.slash_completions.get(app.slash_selected)
+                {
+                    let typed = textarea.lines().join("\n");
+                    match commands::decide_enter(&typed, cmd_idx) {
+                        commands::SlashEnter::Submit => {}
+                        commands::SlashEnter::Run(i) => {
+                            let name = commands::COMMANDS[i].name.to_string();
                             app.slash_completions.clear();
                             app.slash_selected = 0;
                             *textarea = new_textarea();
                             dispatch_slash_command(&name, app, tx);
-                        } else if cmd.has_arg {
-                            // Complete into the textarea so the user can type the arg.
-                            let completion = format!("{} ", cmd.name);
+                            return;
+                        }
+                        commands::SlashEnter::Complete(i) => {
+                            let completion = format!("{} ", commands::COMMANDS[i].name);
                             *textarea = new_textarea();
                             textarea.insert_str(&completion);
                             app.update_slash_completions(&completion);
-                        } else {
-                            // Execute the arg-less command directly.
-                            let name = cmd.name.to_string();
-                            app.slash_completions.clear();
-                            app.slash_selected = 0;
-                            *textarea = new_textarea();
-                            dispatch_slash_command(&name, app, tx);
+                            return;
                         }
                     }
-                    return;
                 }
                 // Chat panel: Enter submits the message
                 let text = textarea.lines().join("\n");
@@ -339,6 +341,33 @@ fn handle_crossterm_event(
                 app.update_slash_completions(&current);
             }
         },
+    }
+}
+
+/// Windows reports Press and Release (and kitty-protocol terminals Repeat): act on Press only,
+/// plus Repeat for navigation and typing keys while editing. Never on Release.
+fn key_accepted(
+    kind: KeyEventKind,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    mode: &InputMode,
+) -> bool {
+    match kind {
+        KeyEventKind::Press => true,
+        KeyEventKind::Release => false,
+        KeyEventKind::Repeat => {
+            *mode == InputMode::Editing
+                && match code {
+                    KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Backspace
+                    | KeyCode::Delete => true,
+                    KeyCode::Char(_) => !modifiers.contains(KeyModifiers::CONTROL),
+                    _ => false,
+                }
+        }
     }
 }
 
@@ -1123,4 +1152,68 @@ fn update_textarea_style(textarea: &mut TextArea, app: &App) {
             .title(title)
             .border_style(style),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_events_are_ignored() {
+        let none = KeyModifiers::NONE;
+        assert!(!key_accepted(
+            KeyEventKind::Release,
+            KeyCode::Char('a'),
+            none,
+            &InputMode::Editing
+        ));
+        assert!(key_accepted(
+            KeyEventKind::Press,
+            KeyCode::Enter,
+            none,
+            &InputMode::Editing
+        ));
+    }
+
+    #[test]
+    fn repeat_only_for_navigation_and_typing() {
+        let none = KeyModifiers::NONE;
+        let edit = InputMode::Editing;
+        assert!(key_accepted(
+            KeyEventKind::Repeat,
+            KeyCode::Down,
+            none,
+            &edit
+        ));
+        assert!(key_accepted(
+            KeyEventKind::Repeat,
+            KeyCode::Char('a'),
+            none,
+            &edit
+        ));
+        assert!(!key_accepted(
+            KeyEventKind::Repeat,
+            KeyCode::Enter,
+            none,
+            &edit
+        ));
+        assert!(!key_accepted(
+            KeyEventKind::Repeat,
+            KeyCode::Tab,
+            none,
+            &edit
+        ));
+        assert!(!key_accepted(
+            KeyEventKind::Repeat,
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL,
+            &edit
+        ));
+        assert!(!key_accepted(
+            KeyEventKind::Repeat,
+            KeyCode::Char('y'),
+            none,
+            &InputMode::Confirming
+        ));
+    }
 }

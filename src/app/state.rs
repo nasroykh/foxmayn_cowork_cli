@@ -204,10 +204,10 @@ impl App {
     /// Call this after every keystroke while in Editing mode.
     pub fn update_slash_completions(&mut self, input: &str) {
         let first_line = input.lines().next().unwrap_or(input);
-        if first_line.starts_with('/') {
-            // Match only on the command word (before any space / argument)
-            let word = first_line.split_whitespace().next().unwrap_or(first_line);
-            let matches = crate::tui::commands::match_commands(word);
+        // Once whitespace follows the command word the user is typing an argument: no popup, so
+        // Enter / Tab can never replace the typed text with a completion.
+        if first_line.starts_with('/') && !first_line.contains(char::is_whitespace) {
+            let matches = crate::tui::commands::match_commands(first_line);
             // Keep the selected index clamped; reset to 0 only when the list changes
             if matches != self.slash_completions {
                 self.slash_selected = 0;
