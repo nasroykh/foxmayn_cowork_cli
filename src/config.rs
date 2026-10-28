@@ -3,12 +3,13 @@ use std::str::FromStr;
 use clap::ValueEnum;
 
 use crate::llm::types::{
-    OllamaThink, OllamaThinkLevel, ReasoningEffort, ReasoningSummaryVerbosity, RequestReasoning,
+    OllamaThink, ReasoningEffort, ReasoningSummaryVerbosity, RequestReasoning,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
 pub enum Provider {
     Ollama,
+    #[value(name = "openrouter", alias = "open-router")]
     OpenRouter,
     /// Offline inference via llama.cpp. Requires building with `--features local`.
     Local,
@@ -83,7 +84,7 @@ pub struct Config {
     /// means omit the field (e.g. `OPENROUTER_REASONING_EFFORT=off`).
     pub openrouter_reasoning: Option<RequestReasoning>,
     /// Set when `PROVIDER=ollama`. Sent as `think` on `/api/chat` (separate from OpenRouter
-    /// `reasoning`). `None` = omit the field (`OLLAMA_THINK=off`).
+    /// `reasoning`). `None` = omit the field (the default, or `OLLAMA_THINK=off`).
     pub ollama_think: Option<OllamaThink>,
     /// Stream tokens as they arrive. Disabled by `STREAMING=false/0/off`. Default: `true`.
     pub streaming_enabled: bool,
@@ -191,21 +192,22 @@ fn tool_display_verbosity_from_env() -> ToolDisplayVerbosity {
     }
 }
 
-/// Ollama `think` per <https://docs.ollama.com/api/chat>. Defaults to `low` so thinking models
-/// work out of the box. Set OLLAMA_THINK=off to omit the field for non-thinking models.
+/// Ollama `think` per <https://docs.ollama.com/api/chat>. Omitted unless `OLLAMA_THINK` is set:
+/// non-thinking models answer HTTP 400 to any `think` value, so it is opt-in.
 fn ollama_think_from_env() -> Option<OllamaThink> {
-    let val = match std::env::var("OLLAMA_THINK") {
-        Ok(s) => s,
-        Err(_) => return Some(OllamaThink::Level(OllamaThinkLevel::Low)),
-    };
+    parse_ollama_think(std::env::var("OLLAMA_THINK").ok().as_deref())
+}
+
+fn parse_ollama_think(val: Option<&str>) -> Option<OllamaThink> {
+    let val = val?;
     if val.is_empty() || val.eq_ignore_ascii_case("off") {
         return None;
     }
     match val.parse::<OllamaThink>() {
         Ok(t) => Some(t),
         Err(e) => {
-            eprintln!("[config] OLLAMA_THINK: {e} -- using low");
-            Some(OllamaThink::Level(OllamaThinkLevel::Low))
+            eprintln!("[config] OLLAMA_THINK: {e} -- omitting think");
+            None
         }
     }
 }
@@ -219,6 +221,7 @@ impl Config {
         {
             "ollama" => Provider::Ollama,
             "local" => Provider::Local,
+            "openrouter" | "open-router" => Provider::OpenRouter,
             _ => Provider::OpenRouter,
         };
 
@@ -324,5 +327,40 @@ impl Config {
             self.skip_confirmations = true;
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::OllamaThinkLevel;
+
+    #[test]
+    fn ollama_think_is_omitted_by_default() {
+        assert_eq!(parse_ollama_think(None), None);
+        assert_eq!(parse_ollama_think(Some("")), None);
+        assert_eq!(parse_ollama_think(Some("off")), None);
+        assert_eq!(parse_ollama_think(Some("garbage")), None);
+        assert_eq!(
+            parse_ollama_think(Some("high")),
+            Some(OllamaThink::Level(OllamaThinkLevel::High))
+        );
+        assert_eq!(
+            parse_ollama_think(Some("true")),
+            Some(OllamaThink::OnOff(true))
+        );
+    }
+
+    #[test]
+    fn provider_cli_accepts_openrouter_and_legacy_alias() {
+        assert_eq!(
+            Provider::from_str("openrouter", true),
+            Ok(Provider::OpenRouter)
+        );
+        assert_eq!(
+            Provider::from_str("open-router", true),
+            Ok(Provider::OpenRouter)
+        );
+        assert_eq!(Provider::from_str("ollama", true), Ok(Provider::Ollama));
     }
 }
