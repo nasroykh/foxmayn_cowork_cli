@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
@@ -7,9 +7,65 @@ pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("foxmayn-cowork").join(".env"))
 }
 
-/// True when the config file is absent and stdin is interactive (skips CI / piped runs).
+/// True when first-run setup should run: no global config file, no provider/key already supplied
+/// through the environment (shell, CI, or the Justfile's `.env`), and stdin is interactive.
 pub fn needs_init() -> bool {
-    io::stdin().is_terminal() && config_path().map(|p| !p.exists()).unwrap_or(false)
+    let env_set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    needs_init_with(
+        io::stdin().is_terminal(),
+        config_path().is_some_and(|p| p.exists()),
+        env_set("OPENROUTER_API_KEY") || env_set("PROVIDER"),
+    )
+}
+
+fn needs_init_with(is_tty: bool, config_exists: bool, env_configured: bool) -> bool {
+    is_tty && !config_exists && !env_configured
+}
+
+/// Write `content` to `path`, owner-read/write only on unix. An existing file with looser
+/// permissions is tightened before the secret is written into it.
+fn write_private(path: &Path, content: &str) -> io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(content.as_bytes())
+}
+
+/// Create the config directory, owner-only on unix.
+fn create_config_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// First 8 characters of an existing key, for the "[current: …]" hint (char-safe).
+fn key_hint(key: &str) -> String {
+    if key.chars().count() > 8 {
+        format!("{}…", key.chars().take(8).collect::<String>())
+    } else {
+        "(set)".to_string()
+    }
 }
 
 // ── Prompt helpers ────────────────────────────────────────────────────────────
@@ -98,13 +154,7 @@ pub fn run_wizard(current: Option<&Config>) -> io::Result<()> {
         0 => {
             // OpenRouter
             let existing = current.and_then(|c| c.openrouter_api_key.as_deref());
-            let hint = existing.map(|k| {
-                if k.len() > 8 {
-                    format!("{}…", &k[..8])
-                } else {
-                    "(set)".to_string()
-                }
-            });
+            let hint = existing.map(key_hint);
 
             print!("OpenRouter API key");
             if let Some(ref h) = hint {
@@ -170,10 +220,10 @@ pub fn run_wizard(current: Option<&Config>) -> io::Result<()> {
     };
 
     if let Some(parent) = cfg_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_config_dir(parent)?;
     }
 
-    std::fs::write(&cfg_path, lines.join("\n") + "\n")?;
+    write_private(&cfg_path, &(lines.join("\n") + "\n"))?;
 
     println!();
     println!("Config saved to {}", cfg_path.display());
@@ -185,4 +235,47 @@ pub fn run_wizard(current: Option<&Config>) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wizard_only_when_nothing_configured_and_interactive() {
+        assert!(needs_init_with(true, false, false));
+        assert!(!needs_init_with(false, false, false));
+        assert!(!needs_init_with(true, true, false));
+        assert!(!needs_init_with(true, false, true));
+    }
+
+    #[test]
+    fn key_hint_is_char_safe() {
+        assert_eq!(key_hint("short"), "(set)");
+        assert_eq!(key_hint("sk-or-v1-abcdef"), "sk-or-v1…");
+        // Byte 8 falls inside a multi-byte char: must not panic.
+        assert_eq!(key_hint("abcdefgéééé"), "abcdefgé…");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_private_even_when_rewritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fcw-setup-test-{}", std::process::id()));
+        create_config_dir(&dir).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+
+        let file = dir.join(".env");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&file, "OPENROUTER_API_KEY=x\n").unwrap();
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "OPENROUTER_API_KEY=x\n"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
