@@ -11,7 +11,7 @@ use super::commands;
 use super::widgets;
 use crate::app::{App, InputMode};
 
-pub fn render(f: &mut Frame, app: &App, textarea: &TextArea) {
+pub fn render(f: &mut Frame, app: &mut App, textarea: &TextArea) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -6,28 +6,63 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::app::{App, ChatRole};
+use super::wrap::wrap_line;
+use crate::app::{App, ChatEntry, ChatRole};
 use crate::config::{Provider, ThinkingDisplay};
 use crate::llm::types::{OllamaThink, OllamaThinkLevel, ReasoningEffort};
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
+/// Width of the `" AI   │ "` gutter drawn before every row of an entry.
+const GUTTER: usize = 8;
+const CONT_GUTTER: &str = "      │ ";
+
+/// Wrapped lines of every finalized `ChatEntry`, so history is parsed (markdown) and wrapped
+/// once per width instead of once per frame. `chat_messages` is append-only apart from the
+/// replacements in `App` that call `invalidate`.
+#[derive(Default)]
+pub struct ChatCache {
+    width: u16,
+    entries_done: usize,
+    lines: Vec<Line<'static>>,
+    /// Total rows (cache + live tail) of the previous frame, to anchor a scrolled-up view.
+    last_total: usize,
+}
+
+impl ChatCache {
+    pub fn invalidate(&mut self) {
+        *self = Self::default();
+    }
+}
+
+pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let title = match &app.working_dir {
         Some(dir) => format!(" {} ", dir.display()),
         None => " Chat ".to_string(),
     };
 
-    let status = status_line(app);
+    let mut status = vec![Span::styled(
+        status_line(app),
+        Style::default().fg(Color::DarkGray),
+    )];
+    if app.config.skip_confirmations {
+        status.insert(
+            0,
+            Span::styled(
+                " CONFIRMATIONS OFF ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .title_top(
-            Line::from(Span::styled(status, Style::default().fg(Color::DarkGray)))
-                .alignment(Alignment::Right),
-        );
+        .title_top(Line::from(status).alignment(Alignment::Right));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.chat_messages.is_empty() {
+    if app.chat_messages.is_empty() && app.streaming_text.is_none() && !app.is_loading {
         let hint = if app.working_dir.is_none() {
             "No directory open. Use --dir <path> at startup or type /dir <path> here."
         } else {
@@ -41,226 +76,193 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    for entry in &app.chat_messages {
-        match entry.role {
-            ChatRole::Assistant => {
-                let prefix_style = Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD);
-                let md_lines = tui_markdown::from_str(&entry.content).lines;
-                if md_lines.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled(" AI   ", prefix_style),
-                        Span::raw("│ "),
-                    ]));
-                } else {
-                    for (i, md_line) in md_lines.into_iter().enumerate() {
-                        let mut spans = if i == 0 {
-                            vec![Span::styled(" AI   ", prefix_style), Span::raw("│ ")]
-                        } else {
-                            vec![Span::raw("       │ ")]
-                        };
-                        spans.extend(md_line.spans);
-                        lines.push(Line::from(spans));
-                    }
-                }
-            }
-            _ => {
-                let (prefix, prefix_style, content_style) = match entry.role {
-                    ChatRole::User => (
-                        " You  ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default().fg(Color::White),
-                    ),
-                    ChatRole::Tool => (
-                        " Tool ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    ChatRole::Thinking => (
-                        " Think",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                    ChatRole::Error => (
-                        " Err  ",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                        Style::default().fg(Color::Red),
-                    ),
-                    ChatRole::Warning => (
-                        " Warn ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    ChatRole::Assistant => unreachable!(),
-                };
-
-                let content_lines: Vec<&str> = entry.content.lines().collect();
-                if content_lines.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, prefix_style),
-                        Span::raw("│ "),
-                    ]));
-                } else {
-                    for (i, content_line) in content_lines.iter().enumerate() {
-                        if i == 0 {
-                            lines.push(Line::from(vec![
-                                Span::styled(prefix, prefix_style),
-                                Span::raw("│ "),
-                                Span::styled(*content_line, content_style),
-                            ]));
-                        } else {
-                            lines.push(Line::from(vec![
-                                Span::raw("       │ "),
-                                Span::styled(*content_line, content_style),
-                            ]));
-                        }
-                    }
-                }
-            }
-        }
-
-        lines.push(Line::from(""));
+    if inner.width == 0 || inner.height == 0 {
+        return;
     }
 
-    if let Some(thinking) = &app.thinking_text
-        && !matches!(app.config.thinking_display, ThinkingDisplay::Off)
-    {
-        let prefix_style = Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD);
-        let content_style = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC);
+    let width = inner.width as usize;
+    let cache = &mut app.chat_cache;
+    if cache.width != inner.width || cache.entries_done > app.chat_messages.len() {
+        cache.invalidate();
+        cache.width = inner.width;
+    }
+    for entry in &app.chat_messages[cache.entries_done..] {
+        cache.lines.extend(entry_lines(entry, width));
+        cache.lines.push(Line::from(""));
+    }
+    cache.entries_done = app.chat_messages.len();
 
-        match app.config.thinking_display {
-            ThinkingDisplay::Inline => {
-                let label = format!("[Thinking… ({} chars)]", thinking.chars().count());
-                lines.push(Line::from(vec![
-                    Span::styled(" Think", prefix_style),
-                    Span::raw("│ "),
-                    Span::styled(label, content_style),
-                ]));
-            }
-            ThinkingDisplay::Full => {
-                let content_lines: Vec<&str> = thinking.lines().collect();
-                if content_lines.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled(" Think", prefix_style),
-                        Span::raw("│ "),
-                        Span::styled("▌", content_style),
-                    ]));
-                } else {
-                    for (i, line) in content_lines.iter().enumerate() {
-                        let is_last = i == content_lines.len() - 1;
-                        let mut spans = if i == 0 {
-                            vec![
-                                Span::styled(" Think", prefix_style),
-                                Span::raw("│ "),
-                                Span::styled(*line, content_style),
-                            ]
-                        } else {
-                            vec![Span::raw("       │ "), Span::styled(*line, content_style)]
-                        };
-                        if is_last {
-                            spans.push(Span::styled("▌", content_style));
-                        }
-                        lines.push(Line::from(spans));
-                    }
-                }
-            }
-            ThinkingDisplay::Off => {}
+    let tail = live_tail(app, width);
+
+    let cache = &mut app.chat_cache;
+    let total = cache.lines.len() + tail.len();
+    let visible = inner.height as usize;
+    let (scroll, start, end) = scroll_window(total, visible, app.chat_scroll, cache.last_total);
+    cache.last_total = total;
+    app.chat_scroll = scroll;
+
+    let window: Vec<Line> = (start..end)
+        .map(|i| match cache.lines.get(i) {
+            Some(l) => l.clone(),
+            None => tail[i - cache.lines.len()].clone(),
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(window), inner);
+}
+
+/// Resolve the visible row range. `scroll` is the distance from the bottom; it is clamped to the
+/// content, and a scrolled-up view is anchored (shifted by the rows added since `last_total`).
+/// Returns `(scroll, start, end)`.
+fn scroll_window(
+    total: usize,
+    visible: usize,
+    scroll: usize,
+    last_total: usize,
+) -> (usize, usize, usize) {
+    let mut scroll = scroll;
+    if scroll > 0 && last_total > 0 && total > last_total {
+        scroll += total - last_total;
+    }
+    let scroll = scroll.min(total.saturating_sub(visible));
+    let end = total - scroll;
+    (scroll, end.saturating_sub(visible), end)
+}
+
+/// Lay out `content` lines behind the role gutter, wrapping each to the remaining width.
+fn gutter_lines(
+    prefix: &'static str,
+    prefix_style: Style,
+    content: Vec<Line>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let cw = width.saturating_sub(GUTTER).max(1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in &content {
+        for row in wrap_line(line, cw) {
+            let mut spans = if out.is_empty() {
+                vec![Span::styled(prefix, prefix_style), Span::raw("│ ")]
+            } else {
+                vec![Span::raw(CONT_GUTTER)]
+            };
+            spans.extend(row);
+            out.push(Line::from(spans));
         }
     }
-
-    if let Some(text) = &app.streaming_text {
-        let prefix_style = Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD);
-        let content_style = Style::default().fg(Color::White);
-        let content_lines: Vec<&str> = text.lines().collect();
-
-        if content_lines.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(" AI   ", prefix_style),
-                Span::raw("│ "),
-                Span::styled("▌", content_style),
-            ]));
-        } else {
-            for (i, line) in content_lines.iter().enumerate() {
-                let is_last = i == content_lines.len() - 1;
-                let mut spans = if i == 0 {
-                    vec![
-                        Span::styled(" AI   ", prefix_style),
-                        Span::raw("│ "),
-                        Span::styled(*line, content_style),
-                    ]
-                } else {
-                    vec![Span::raw("       │ "), Span::styled(*line, content_style)]
-                };
-                if is_last {
-                    spans.push(Span::styled("▌", content_style));
-                }
-                lines.push(Line::from(spans));
-            }
-        }
-    } else if app.is_loading {
-        lines.push(Line::from(vec![
-            Span::styled(
-                " AI   ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
+    if out.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled(prefix, prefix_style),
             Span::raw("│ "),
-            Span::styled(
-                "thinking...",
+        ]));
+    }
+    out
+}
+
+fn plain_lines(text: &str, style: Style) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), style)))
+        .collect()
+}
+
+fn entry_lines(entry: &ChatEntry, width: usize) -> Vec<Line<'static>> {
+    let bold = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    match entry.role {
+        ChatRole::Assistant => {
+            let content = tui_markdown::from_str(&entry.content).lines;
+            gutter_lines(" AI   ", bold(Color::Green), content, width)
+        }
+        ChatRole::User => gutter_lines(
+            " You  ",
+            bold(Color::Cyan),
+            plain_lines(&entry.content, Style::default().fg(Color::White)),
+            width,
+        ),
+        ChatRole::Tool => gutter_lines(
+            " Tool ",
+            bold(Color::Yellow),
+            plain_lines(&entry.content, Style::default().fg(Color::DarkGray)),
+            width,
+        ),
+        ChatRole::Thinking => gutter_lines(
+            " Think",
+            bold(Color::Magenta),
+            plain_lines(
+                &entry.content,
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
             ),
-        ]));
+            width,
+        ),
+        ChatRole::Error => gutter_lines(
+            " Err  ",
+            bold(Color::Red),
+            plain_lines(&entry.content, Style::default().fg(Color::Red)),
+            width,
+        ),
+        ChatRole::Warning => gutter_lines(
+            " Warn ",
+            bold(Color::Yellow),
+            plain_lines(&entry.content, Style::default().fg(Color::Yellow)),
+            width,
+        ),
+    }
+}
+
+/// Rows for in-progress content (reasoning, streamed text, spinner), rebuilt every frame.
+fn live_tail(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let bold = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    let cursor = |style: Style| Span::styled("▌", style);
+
+    if let Some(thinking) = &app.thinking_text {
+        let content_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        match app.config.thinking_display {
+            ThinkingDisplay::Off => {}
+            ThinkingDisplay::Inline => {
+                let label = format!("[Thinking… ({} chars)]", thinking.chars().count());
+                lines.extend(gutter_lines(
+                    " Think",
+                    bold(Color::Magenta),
+                    vec![Line::from(Span::styled(label, content_style))],
+                    width,
+                ));
+            }
+            ThinkingDisplay::Full => {
+                let mut content = plain_lines(thinking, content_style);
+                match content.last_mut() {
+                    Some(last) => last.spans.push(cursor(content_style)),
+                    None => content.push(Line::from(cursor(content_style))),
+                }
+                lines.extend(gutter_lines(" Think", bold(Color::Magenta), content, width));
+            }
+        }
     }
 
-    // Compute actual display rows accounting for line wrapping.
-    let col_width = (inner.width.max(1)) as usize;
-    let total: u16 = lines
-        .iter()
-        .map(|line| {
-            let w = line.width();
-            if w == 0 {
-                1usize
-            } else {
-                w.div_ceil(col_width)
-            }
-        })
-        .sum::<usize>()
-        .min(u16::MAX as usize) as u16;
-
-    let visible = inner.height;
-    // auto-scroll offset: keeps bottom visible when chat_scroll == 0
-    let bottom_offset = total.saturating_sub(visible);
-    let scroll = bottom_offset.saturating_sub(app.chat_scroll as u16);
-
-    f.render_widget(
-        Paragraph::new(lines)
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
+    if let Some(text) = &app.streaming_text {
+        let content_style = Style::default().fg(Color::White);
+        let mut content = plain_lines(text, content_style);
+        match content.last_mut() {
+            Some(last) => last.spans.push(cursor(content_style)),
+            None => content.push(Line::from(cursor(content_style))),
+        }
+        lines.extend(gutter_lines(" AI   ", bold(Color::Green), content, width));
+    } else if app.is_loading {
+        lines.extend(gutter_lines(
+            " AI   ",
+            bold(Color::Green),
+            vec![Line::from(Span::styled(
+                "thinking...",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ))],
+            width,
+        ));
+    }
+    lines
 }
 
 fn status_line(app: &App) -> String {
@@ -309,4 +311,27 @@ fn status_line(app: &App) -> String {
     };
 
     format!(" {provider} · {model} · {reasoning} ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottom_view_shows_last_rows() {
+        assert_eq!(scroll_window(100, 10, 0, 100), (0, 90, 100));
+    }
+
+    #[test]
+    fn scroll_is_clamped_to_content() {
+        assert_eq!(scroll_window(100, 10, 1_000_000, 100), (90, 0, 10));
+        assert_eq!(scroll_window(5, 10, 3, 5), (0, 0, 5));
+    }
+
+    #[test]
+    fn scrolled_view_stays_anchored_while_rows_grow() {
+        assert_eq!(scroll_window(110, 10, 20, 100), (30, 70, 80));
+        // At the bottom the view just follows.
+        assert_eq!(scroll_window(110, 10, 0, 100), (0, 100, 110));
+    }
 }

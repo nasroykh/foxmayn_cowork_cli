@@ -137,6 +137,8 @@ pub struct App {
     /// finalized based on `Config::thinking_display`. `None` when no reasoning has arrived.
     pub thinking_text: Option<String>,
     pub chat_scroll: usize,
+    /// Rendered (wrapped) lines of finalized chat entries. See `tui::widgets::chat::ChatCache`.
+    pub chat_cache: crate::tui::widgets::chat::ChatCache,
     pub file_tree_scroll: usize,
     pub focused_panel: Panel,
     pub should_quit: bool,
@@ -184,6 +186,7 @@ impl App {
             streaming_text: None,
             thinking_text: None,
             chat_scroll: 0,
+            chat_cache: Default::default(),
             file_tree_scroll: 0,
             focused_panel: Panel::Chat,
             should_quit: false,
@@ -346,16 +349,17 @@ impl App {
             content: text.to_owned(),
         });
         self.is_loading = true;
+        self.chat_scroll = 0;
     }
 
-    /// Append a streamed content / thinking delta and auto-scroll to bottom.
+    /// Append a streamed content / thinking delta. A view at the bottom follows the stream;
+    /// a scrolled-up view stays anchored (the renderer compensates).
     /// Thinking deltas are dropped when `ThinkingDisplay::Off` so we never carry useless state.
     pub fn handle_stream_chunk(&mut self, chunk: &StreamChunk) {
         match chunk {
             StreamChunk::ContentDelta(text) => {
                 let buf = self.streaming_text.get_or_insert_with(String::new);
                 buf.push_str(text);
-                self.chat_scroll = 0;
             }
             StreamChunk::ThinkingDelta(text) => {
                 if matches!(self.config.thinking_display, ThinkingDisplay::Off) {
@@ -363,7 +367,6 @@ impl App {
                 }
                 let buf = self.thinking_text.get_or_insert_with(String::new);
                 buf.push_str(text);
-                self.chat_scroll = 0;
             }
             _ => {}
         }
@@ -589,6 +592,7 @@ impl App {
         self.working_dir = Some(path);
         self.conversation.clear();
         self.chat_messages.clear();
+        self.chat_cache.invalidate();
         self.pending_confirmation = None;
         self.input_mode = InputMode::Editing;
         self.file_tree_scroll = 0;
@@ -601,6 +605,7 @@ impl App {
     pub fn clear_conversation(&mut self) {
         self.conversation.clear();
         self.chat_messages.clear();
+        self.chat_cache.invalidate();
         self.pending_confirmation = None;
         self.streaming_text = None;
         self.thinking_text = None;
@@ -668,6 +673,7 @@ impl App {
         };
         self.conversation = conv;
         self.chat_messages = msgs;
+        self.chat_cache.invalidate();
         self.current_session_id = Some(id);
         self.chat_scroll = 0;
         true
