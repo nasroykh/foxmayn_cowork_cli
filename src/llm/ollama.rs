@@ -271,7 +271,6 @@ pub async fn model_supports_tools(
 /// Returns `Ok(true)` only when `thinking` appears in the model's `capabilities`. Callers
 /// should drop the `think` request field when this is `false` (non-thinking models answer
 /// HTTP 400 to any `think` value). A missing `capabilities` field counts as unsupported.
-#[allow(dead_code)]
 pub async fn model_supports_thinking(
     client: &reqwest::Client,
     base_url: &str,

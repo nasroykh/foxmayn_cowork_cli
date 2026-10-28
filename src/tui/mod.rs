@@ -865,7 +865,12 @@ async fn fetch_ollama_models(client: &reqwest::Client, base_url: &str) -> Vec<St
     }
 
     let url = format!("{base_url}/api/tags");
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(resp) => match resp.json::<TagsResponse>().await {
             Ok(data) => data.models.into_iter().map(|m| m.name).collect(),
             Err(_) => Vec::new(),

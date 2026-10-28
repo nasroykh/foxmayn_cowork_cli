@@ -123,7 +123,7 @@ async fn main() {
     let env_config = Config::from_env().with_overrides(cli.provider, None, None, false);
     let (saved_config, saved_warning) = storage::apply_saved_settings(env_config, &storage);
     startup_warnings.extend(saved_warning);
-    let config =
+    let mut config =
         saved_config.with_overrides(None, cli.model, cli.streaming, cli.skip_confirmations);
 
     if let Err(msg) = preflight(&config) {
@@ -178,6 +178,24 @@ async fn main() {
                 eprintln!("Warning: {warning}");
                 startup_warnings.push(warning);
             }
+        }
+
+        // Non-thinking models answer HTTP 400 to any `think` value; drop it rather than fail.
+        if config.ollama_think.is_some()
+            && let Ok(false) = llm::ollama::model_supports_thinking(
+                &llm_runtime.http_client,
+                &config.ollama_base_url,
+                &config.model,
+            )
+            .await
+        {
+            let warning = format!(
+                "Ollama model '{}' does not support thinking; ignoring OLLAMA_THINK.",
+                config.model
+            );
+            eprintln!("Warning: {warning}");
+            startup_warnings.push(warning);
+            config.ollama_think = None;
         }
     }
 
