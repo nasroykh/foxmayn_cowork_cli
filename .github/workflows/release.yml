@@ -8,17 +8,39 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  create-release:
+  # Gate: tag must match Cargo.toml version and the test suite must pass.
+  verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Check tag matches Cargo.toml version
+        run: |
+          cargo_version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "${GITHUB_REF_NAME}" != "v${cargo_version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${cargo_version}" >&2
+            exit 1
+          fi
+      - name: cargo test
+        run: cargo test --locked
+
+  create-release:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: taiki-e/create-gh-release-action@v1
+      # Fails when CHANGELOG.md has no `## [X.Y.Z]` section for the tag.
+      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
         with:
           changelog: CHANGELOG.md
-          allow-missing-changelog: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -30,10 +52,10 @@ jobs:
           - os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install build dependencies (ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get install -y cmake clang libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
       - name: Install build dependencies (macOS)
         if: startsWith(matrix.os, 'macos')
         run: brew install cmake llvm
@@ -41,10 +63,10 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         run: echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> $GITHUB_ENV
       - name: cargo check --features local
-        run: cargo check --features local
+        run: cargo check --locked --features local
 
   upload-assets:
-    needs: create-release
+    needs: [create-release, verify, check-local-feature]
     strategy:
       matrix:
         include:
@@ -60,24 +82,25 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Cross-compile Linux aarch64 from an x86_64 ubuntu runner
       - name: Install cross-compilation tools
-        uses: taiki-e/setup-cross-toolchain-action@v1
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
         with:
           target: ${{ matrix.target }}
         if: startsWith(matrix.os, 'ubuntu')
 
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: foxmayn-cowork
           target: ${{ matrix.target }}
-          # Archive pattern mirrors the ffc convention: foxmayn-cowork_v0.1.0_x86_64-unknown-linux-gnu.tar.gz
+          # Archive pattern: foxmayn-cowork_v1.0.0_x86_64-unknown-linux-gnu.tar.gz
           archive: foxmayn-cowork_$tag_$target
           checksum: sha256
           include: README.md
           tar: unix
           zip: windows
+          locked: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

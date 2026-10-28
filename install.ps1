@@ -10,7 +10,8 @@ $Binary = "foxmayn-cowork.exe"
 # --- detect arch ---
 $Arch = switch ($env:PROCESSOR_ARCHITECTURE) {
     "AMD64" { "x86_64" }
-    "ARM64" { "aarch64" }
+    # No native ARM64 build yet; Windows on ARM runs the x64 binary under emulation.
+    "ARM64" { "x86_64" }
     default {
         Write-Error "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE"
         exit 1
@@ -18,6 +19,9 @@ $Arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 
 $Target = "${Arch}-pc-windows-msvc"
+
+# Windows PowerShell 5.1 defaults to older TLS versions that GitHub rejects.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # --- resolve latest release tag ---
 $Release    = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
@@ -41,10 +45,19 @@ try {
     Invoke-WebRequest -Uri $ChecksumUrl  -OutFile $ChecksumPath -UseBasicParsing
 
     # --- verify checksum ---
-    $Expected = (Get-Content $ChecksumPath).Trim() -split '\s+' | Select-Object -First 1
-    $Actual   = (Get-FileHash -Algorithm SHA256 -Path $ArchivePath).Hash.ToLower()
+    $ChecksumText = (Get-Content $ChecksumPath -Raw)
+    if ([string]::IsNullOrWhiteSpace($ChecksumText)) {
+        Write-Error "Checksum file is empty; refusing to install."
+        exit 1
+    }
+    $Expected = ($ChecksumText.Trim() -split '\s+' | Select-Object -First 1).ToLower()
+    if ($Expected -notmatch '^[0-9a-f]{64}$') {
+        Write-Error "Checksum file is malformed (expected a SHA256 hex digest); refusing to install."
+        exit 1
+    }
+    $Actual = (Get-FileHash -Algorithm SHA256 -Path $ArchivePath).Hash.ToLower()
 
-    if ($Expected -and ($Actual -ne $Expected.ToLower())) {
+    if ($Actual -ne $Expected) {
         Write-Error "Checksum mismatch!`n  Expected: $Expected`n  Got:      $Actual"
         exit 1
     }
@@ -60,8 +73,12 @@ try {
 
     # --- add to user PATH if missing ---
     $UserPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
-    if ($UserPath -notlike "*$InstallDir*") {
-        [System.Environment]::SetEnvironmentVariable("PATH", "$UserPath;$InstallDir", "User")
+    if ($null -eq $UserPath) { $UserPath = "" }
+    $PathEntries = @($UserPath -split ';' | Where-Object { $_ -ne "" })
+    $Normalized  = $InstallDir.TrimEnd('\')
+    if (-not ($PathEntries | Where-Object { $_.TrimEnd('\') -ieq $Normalized })) {
+        $NewPath = (@($PathEntries) + $InstallDir) -join ';'
+        [System.Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
         Write-Host ""
         Write-Host "Added $InstallDir to your PATH."
         Write-Host "Restart your terminal for the change to take effect."

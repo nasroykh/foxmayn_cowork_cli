@@ -1,3 +1,5 @@
+set dotenv-load
+
 default: help
 
 # Show this help
@@ -28,7 +30,7 @@ run-ollama-self:
 
 # Run with OpenRouter pointing at the project itself
 run-openrouter-self:
-    cargo run -- --dir . --provider open-router
+    cargo run -- --dir . --provider openrouter
 
 # Run with a specific model override
 run-model dir model:
@@ -65,7 +67,7 @@ check:
     cargo check
 
 lint:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
 fmt:
     cargo fmt
@@ -73,8 +75,15 @@ fmt:
 fmt-check:
     cargo fmt -- --check
 
-# Run check + lint + fmt-check in one shot
-ci: fmt-check lint check
+test:
+    cargo test
+
+# Scan dependencies for known vulnerabilities (needs: cargo install cargo-audit)
+audit:
+    cargo audit
+
+# Run fmt-check + lint + check + test in one shot
+ci: fmt-check lint check test
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
