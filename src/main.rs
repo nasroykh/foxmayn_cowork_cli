@@ -76,6 +76,14 @@ fn load_global_env() {
     }
 }
 
+/// The wizard just wrote `MODEL` to the config file. Drop remembered `/model` choices so the
+/// new value is not shadowed by an older saved one.
+fn forget_saved_models() {
+    if let Err(e) = storage::Storage::open().clear_saved_models() {
+        eprintln!("Warning: could not clear the saved model choice: {e}");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -84,11 +92,14 @@ async fn main() {
 
     // `foxmayn-cowork config`: load existing config for defaults, run wizard, exit.
     if matches!(cli.command, Some(Commands::Config)) {
-        let current = Config::from_env();
+        // Show the model that is actually in use (a saved `/model` choice beats the .env one).
+        let (current, _) =
+            storage::apply_saved_settings(Config::from_env(), &storage::Storage::open());
         if let Err(e) = setup::run_wizard(Some(&current)) {
             eprintln!("Config error: {e}");
             std::process::exit(1);
         }
+        forget_saved_models();
         return;
     }
 
@@ -98,6 +109,7 @@ async fn main() {
             eprintln!("Setup error: {e}");
             std::process::exit(1);
         }
+        forget_saved_models();
         load_global_env();
     }
 

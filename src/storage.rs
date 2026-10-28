@@ -194,6 +194,16 @@ impl Storage {
         Ok(())
     }
 
+    /// Forget every remembered `/model` choice. Called after the config wizard writes `MODEL`,
+    /// because a saved `model.<provider>` would otherwise override it on the next launch.
+    pub fn clear_saved_models(&self) -> rusqlite::Result<()> {
+        self.global.execute(
+            "DELETE FROM settings WHERE key = 'model' OR key LIKE 'model.%'",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Open (or create) the project DB for `working_dir` (pass the canonical path). On failure
     /// the app keeps working without persistence and the error is returned for display.
     pub fn open_project(&mut self, working_dir: &Path) -> Result<(), String> {
@@ -390,6 +400,23 @@ mod tests {
         cfg.provider = Provider::Ollama;
         let (cfg, _) = apply_saved_settings(cfg, &storage);
         assert_eq!(cfg.model, "qwen3:8b");
+    }
+
+    #[test]
+    fn clear_saved_models_removes_only_model_keys() {
+        let storage = Storage::in_memory();
+        storage.save_setting("model.ollama", "a").unwrap();
+        storage.save_setting("model.openrouter", "b").unwrap();
+        storage.save_setting("model", "legacy").unwrap();
+        storage.save_setting("streaming_enabled", "true").unwrap();
+        storage.clear_saved_models().unwrap();
+        let left: Vec<String> = storage
+            .load_settings()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(left, vec!["streaming_enabled".to_string()]);
     }
 
     #[test]
