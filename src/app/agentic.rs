@@ -317,6 +317,17 @@ pub(super) fn format_tool_error(msg: &str) -> String {
         );
     }
 
+    // Before the generic "not found" branch: a missing search string is not a missing path.
+    if lower.contains("search text") {
+        return format!(
+            "Error: {msg}\n\
+             Hint: the file exists; `patch_file` needs a search string that appears EXACTLY \
+             ONCE. Read the file with `read_file` first, then choose a longer/more unique \
+             substring that matches the content character for character. If the change is \
+             broad, use `edit_file` instead."
+        );
+    }
+
     if lower.contains("no such file") || lower.contains("not found") || lower.contains("nosuchfile")
     {
         return format!(
@@ -349,15 +360,6 @@ pub(super) fn format_tool_error(msg: &str) -> String {
             "Error: {msg}\n\
              Hint: your pattern did not match anything actionable. Either widen the regex or \
              confirm with the user that there is anything to do."
-        );
-    }
-
-    if lower.contains("must appear exactly once") || lower.contains("does not appear in") {
-        return format!(
-            "Error: {msg}\n\
-             Hint: `patch_file` needs a search string that appears EXACTLY ONCE. Read the file \
-             with `read_file` first, then choose a longer/more unique substring. If the change \
-             is broad, use `edit_file` instead."
         );
     }
 
@@ -651,6 +653,19 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn patch_file_errors_get_the_patch_hint_not_the_path_hint() {
+        for msg in [
+            "Search text not found in file",
+            "Search text is ambiguous: found 3 occurrences, expected exactly 1.",
+        ] {
+            let out = format_tool_error(msg);
+            assert!(out.contains("patch_file"), "{out}");
+            assert!(!out.contains("path does not exist"), "{out}");
+        }
+        assert!(format_tool_error("No such file or directory").contains("path does not exist"));
+    }
 
     fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall {
