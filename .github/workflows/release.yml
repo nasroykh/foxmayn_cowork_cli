@@ -44,8 +44,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Informational: prebuilt binaries do not ship the `local` feature, so a
+  # llama.cpp build break must not block the release.
   check-local-feature:
+    continue-on-error: true
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -66,7 +70,7 @@ jobs:
         run: cargo check --locked --features local
 
   upload-assets:
-    needs: [create-release, verify, check-local-feature]
+    needs: [create-release, verify]
     strategy:
       matrix:
         include:
