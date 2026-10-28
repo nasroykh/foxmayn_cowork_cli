@@ -23,11 +23,12 @@ impl LlmRuntime {
     /// point rather than a later `llm::chat` error.
     pub async fn build(config: &Config) -> Result<Self, AppError> {
         let http_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            // No global request timeout: streaming responses can run for many minutes.
-            // connect_timeout guards against stalled TCP handshakes.
-            .build()
-            .expect("reqwest TLS init failed");
+            .connect_timeout(std::time::Duration::from_secs(15))
+            // Idle timeout per read, not a total timeout: streams can run for many minutes, but
+            // a stalled connection must not hang forever. Generous because a local Ollama
+            // model may take minutes to load before the first byte.
+            .read_timeout(std::time::Duration::from_secs(300))
+            .build()?;
 
         if matches!(config.provider, Provider::Local) {
             #[cfg(feature = "local")]

@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::fs::FileEntry;
-use crate::llm::types::{Message, StreamChunk};
+use crate::llm::types::{Message, StreamChunk, ToolCall};
 
 pub type RequestId = u64;
 
@@ -18,6 +18,10 @@ pub enum LlmOutcome {
         arguments: serde_json::Value,
         tool_call_id: Option<String>,
         user_message: String,
+        /// Calls of the same assistant message that follow the gated one and have not run yet.
+        remaining: Vec<ToolCall>,
+        /// Non-streaming `[tool]` summary lines collected so far in this turn.
+        summaries: Vec<String>,
     },
     Error {
         message: String,

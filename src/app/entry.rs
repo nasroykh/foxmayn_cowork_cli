@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
 
@@ -6,10 +6,9 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::llm::runtime::LlmRuntime;
-use crate::llm::tools::execute_tool;
-use crate::llm::types::{FunctionCall, Message};
+use crate::llm::types::Message;
 
-use super::agentic::run_agentic_loop;
+use super::agentic::{resolve_pending, run_agentic_loop};
 use super::events::{AppEvent, LlmOutcome, RequestId};
 use super::state::PendingToolCall;
 use super::system_prompt::{system_prompt, working_dir_summary};
@@ -46,6 +45,7 @@ pub async fn send_message(
         conversation,
         Some(user_msg),
         user_message,
+        Vec::new(),
         None,
     )
     .await
@@ -55,61 +55,17 @@ pub async fn confirm_tool(
     runtime: LlmRuntime,
     config: Arc<Config>,
     working_dir: Option<PathBuf>,
-    mut conversation: Vec<Message>,
+    conversation: Vec<Message>,
     pending: PendingToolCall,
     approved: bool,
 ) -> (LlmOutcome, Vec<Message>) {
-    if !approved {
-        return (
-            LlmOutcome::Complete {
-                assistant_message: "Operation cancelled.".into(),
-                tool_results: vec![],
-            },
-            conversation,
-        );
-    }
-
-    let base_path = match &working_dir {
-        Some(p) => p.clone(),
-        None => {
-            return (
-                LlmOutcome::Error {
-                    message: "No working directory set.".into(),
-                },
-                conversation,
-            );
-        }
-    };
-
-    let call = FunctionCall {
-        name: pending.tool_name.clone(),
-        arguments: pending.arguments,
-    };
-
-    let result_str = match execute_tool(&call, &base_path).await {
-        Ok(s) => s,
-        Err(e) => format!("Error: {e}"),
-    };
-
-    conversation.push(Message::tool_result(
-        &pending.tool_name,
-        &result_str,
-        pending.tool_call_id,
-    ));
-
-    let dir_listing = working_dir_summary(base_path.as_path()).await;
-    let mut working: Vec<Message> =
-        vec![Message::system(system_prompt(&working_dir, &dir_listing))];
-    working.extend(conversation.iter().cloned());
-
-    run_agentic_loop(
-        &runtime,
-        &config,
-        base_path.as_path(),
-        working,
+    confirm_tool_inner(
+        runtime,
+        config,
+        working_dir,
         conversation,
-        None,
-        String::new(),
+        pending,
+        approved,
         None,
     )
     .await
@@ -149,6 +105,7 @@ pub async fn send_message_streaming(
         conversation,
         Some(user_msg),
         user_message,
+        Vec::new(),
         Some((request_id, &tx)),
     )
     .await
@@ -162,49 +119,69 @@ pub async fn confirm_tool_streaming(
     runtime: LlmRuntime,
     config: Arc<Config>,
     working_dir: Option<PathBuf>,
-    mut conversation: Vec<Message>,
+    conversation: Vec<Message>,
     pending: PendingToolCall,
     approved: bool,
     request_id: RequestId,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> (LlmOutcome, Vec<Message>) {
-    if !approved {
+    confirm_tool_inner(
+        runtime,
+        config,
+        working_dir,
+        conversation,
+        pending,
+        approved,
+        Some((request_id, &tx)),
+    )
+    .await
+}
+
+/// Shared body of `confirm_tool` / `confirm_tool_streaming`. Answers the gated call and every
+/// call queued behind it before any further LLM request (see `resolve_pending`).
+async fn confirm_tool_inner(
+    runtime: LlmRuntime,
+    config: Arc<Config>,
+    working_dir: Option<PathBuf>,
+    mut conversation: Vec<Message>,
+    pending: PendingToolCall,
+    approved: bool,
+    stream_ctx: Option<(RequestId, &mpsc::UnboundedSender<AppEvent>)>,
+) -> (LlmOutcome, Vec<Message>) {
+    let Some(base_path) = working_dir.clone() else {
+        // Nothing can run without a directory; decline so the history stays valid.
+        resolve_pending(
+            pending,
+            false,
+            Path::new(""),
+            &config,
+            stream_ctx,
+            &mut conversation,
+            &mut Vec::new(),
+        )
+        .await;
         return (
-            LlmOutcome::Complete {
-                assistant_message: "Operation cancelled.".into(),
-                tool_results: vec![],
+            LlmOutcome::Error {
+                message: "No working directory set.".into(),
             },
             conversation,
         );
+    };
+
+    let mut summaries = Vec::new();
+    if let Some(outcome) = resolve_pending(
+        pending,
+        approved,
+        base_path.as_path(),
+        &config,
+        stream_ctx,
+        &mut conversation,
+        &mut summaries,
+    )
+    .await
+    {
+        return (outcome, conversation);
     }
-
-    let base_path = match &working_dir {
-        Some(p) => p.clone(),
-        None => {
-            return (
-                LlmOutcome::Error {
-                    message: "No working directory set.".into(),
-                },
-                conversation,
-            );
-        }
-    };
-
-    let call = FunctionCall {
-        name: pending.tool_name.clone(),
-        arguments: pending.arguments,
-    };
-
-    let result_str = match execute_tool(&call, &base_path).await {
-        Ok(s) => s,
-        Err(e) => format!("Error: {e}"),
-    };
-
-    conversation.push(Message::tool_result(
-        &pending.tool_name,
-        &result_str,
-        pending.tool_call_id,
-    ));
 
     let dir_listing = working_dir_summary(base_path.as_path()).await;
     let mut working: Vec<Message> =
@@ -219,7 +196,8 @@ pub async fn confirm_tool_streaming(
         conversation,
         None,
         String::new(),
-        Some((request_id, &tx)),
+        summaries,
+        stream_ctx,
     )
     .await
 }
