@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use ratatui_textarea::TextArea;
 
@@ -11,7 +11,7 @@ use super::commands;
 use super::widgets;
 use crate::app::{App, InputMode};
 
-pub fn render(f: &mut Frame, app: &App, textarea: &TextArea) {
+pub fn render(f: &mut Frame, app: &mut App, textarea: &TextArea) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -94,7 +94,11 @@ fn render_completions(f: &mut Frame, app: &App, chat_area: Rect, input_area: Rec
             )),
     );
 
-    f.render_widget(list, popup_area);
+    // Clear first so chat text underneath never shows through; ListState keeps the selection
+    // scrolled into view when there are more rows than fit.
+    let mut state = ListState::default().with_selected(Some(app.slash_selected));
+    f.render_widget(Clear, popup_area);
+    f.render_stateful_widget(list, popup_area, &mut state);
 }
 
 fn render_picker(
@@ -133,7 +137,9 @@ fn render_picker(
             )),
     );
 
-    f.render_widget(list, popup_area);
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    f.render_widget(Clear, popup_area);
+    f.render_stateful_widget(list, popup_area, &mut state);
 }
 
 fn render_input_bar(f: &mut Frame, app: &App, textarea: &TextArea, area: Rect) {
